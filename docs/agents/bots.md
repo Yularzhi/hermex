@@ -34,11 +34,16 @@ Replay detects discontinuity but never appends text to an overlapping snapshot.
 Live events coalesce inflight snapshot reads using `omit_messages`; that installed
 handler path avoids history database reads. Completion and session-state events
 request full history. There is no transcript cache or speculative REST adapter.
-Socket loss shows disconnected/unknown. Foreground and explicit reconnect reload
-canonical identity, history and current state before enabling commands.
+Transient socket loss reconnects silently while the chat is active, with delays
+of 1, 2, 4, 8, 16 and then at most 30 seconds. Leaving the screen or backgrounding
+cancels recovery. Foreground/recovery reloads canonical identity, history and
+current state before enabling commands. Authentication, identity and unsupported
+host errors still surface actionable messages; commands are never retried.
 
 The transcript follows a stable trailing anchor until the user scrolls into
-history; Latest resumes following. Coalesced text snapshots use synchronous
+history; the shared Sessions down-arrow resumes following. Its visibility uses
+Sessions’ scroll observer, follow latch and near-bottom thresholds,
+so it disappears on reaching the bottom. Coalesced text snapshots use synchronous
 Markdown rendering without token reveal animations. The deferred streaming
 renderer can leave a growing Bot response's trailing viewport blank; an XCTest
 renders evolving snapshots and checks the actual visible output.
@@ -213,21 +218,22 @@ Missing methods/routes fail visibly and preserve the draft; removing attachments
 leaves the existing text-only path available. Cancellation and partial failure
 never submit the partial set. Files already uploaded remain host-owned; there is
 no verified session-scoped delete API, and the client never deletes guessed paths.
-Cancel upload retains the local draft. A lost prompt acknowledgment holds text
-and copies until the user explicitly restores or discards the draft. Accepted
-sends clear the durable record before deleting local copies.
+Cancel upload retains the local draft. A lost prompt acknowledgment preserves text
+and local copies; recovery silently restores them to the ordinary composer.
+Accepted sends clear the durable record before deleting local copies.
 
 Bot drafts extend `ChatDraftStore` with server + connection UUID + Profile context.
 After uploads finish, immediately before prompt submission, the client flushes an
 unresolved marker to disk. Upload interruptions never mark a draft ambiguous. An acknowledged
 send consumes the draft; explicit admission failures preserve its text. An
-ambiguous outcome stays held across navigation and relaunch. The user can check
-the conversation and explicitly restore the draft or discard it. Restoring retains
-text and local attachments and enables Send; neither recovery action submits a prompt.
-The composer stays editable while an outcome is unknown. Send offers explicit
-confirmation, restores the draft, and dispatches only after recovery succeeds; it
-queues the confirmed draft if work is already running. No automatic retry occurs.
-Identical text in recovered history cannot reliably attribute a submission.
+ambiguous outcome preserves its draft across navigation and relaunch. During
+recovery, the client clears the local unresolved marker without changing text or
+attachments, then reloads the host state before enabling commands. No held-message
+warning, resolve/discard dialog or extra resend confirmation appears. The composer
+stays editable, and the next deliberate Send/Steer/Queue/Redirect uses its ordinary
+rules. A lost or unrecognized acknowledgment schedules recovery; it never causes
+an automatic prompt retry. Identical text in recovered history cannot reliably
+attribute a submission, so it never silently consumes the restored draft.
 
 The composer offers Send for idle work and a Sessions-style native menu for
 Steer, Queue and Redirect while busy. Selecting a mode does not submit. The
@@ -244,7 +250,8 @@ which prevents a raced Desktop turn from turning a fresh send into the host's
 configured steer/interrupt behavior. `queued` acknowledges a follow-up;
 `streaming` acknowledges immediate admission if the previous work already ended.
 The handler's `voice_stopped: true` special case is reported as speech stopped,
-not as a new prompt. Unknown result shapes stay ambiguous and held.
+not as a new prompt. Unknown result shapes preserve the draft and recover the
+connection; they are never treated as successful sends.
 
 All four modes share the durable submission marker. An action captures the
 connection generation, runtime, turn revision and draft at the tap; confirmation
@@ -351,3 +358,62 @@ The implementation issue links the installed contract evidence, signed-build and
 test results, and remaining manual gates. Physical-phone transport, native
 accessibility and integrated live behavior must be validated before declaring
 the MVP complete. Simulator or isolated fixtures are not physical-phone evidence.
+
+## Chat controls
+
+The Bot composer reuses Sessions' model/effort menu, model sheet, workspace picker
+and context indicator. `BotChatControls` owns their connection/Profile/runtime
+context independently of webui configuration. The ready composer stays quiet;
+the expanded row contains the model/effort, workspace, fast mode and the Sessions context ring.
+Session controls appear in the navigation bar only when the host reports them.
+
+`model.options` supplies provider groups, model choices and the active agent's
+model/provider. Do not take the active selection from `session.info.model`: that
+field deliberately projects a queued next-turn choice. `config.set` is allowlisted
+for model, reasoning and fast. Model requires a runtime and an explicit `--session` flag plus
+`scope: session`. The value is `<model> --provider <provider> --session`; identifiers
+containing flag tokens or whitespace are rejected before dispatch because the
+host uses a whitespace parser, not shell quoting. The model reply's `key`, `value`, `scope`, `confirm_required`, `confirm_message`
+and `deferred` determine whether to request confirmation, show a next-turn pick,
+or re-read the active model. No pending pick gets an active checkmark. Reads are
+coalesced on session-info, turn-boundary and session-control events, never polled.
+
+Reasoning and fast mode use `config.set` with `{profile, session_id, scope:
+"session", key, value}`. Reasoning sends only `none`, `minimal`, `low`, `medium`,
+`high`, `xhigh`, `max` or `ultra` (never the host's display commands). Fast sends
+`fast` or `normal`, never a retry-sensitive toggle. Matching `key`/`value` replies
+acknowledge the selection; rejections preserve the old value. Both choices are
+bound to the captured runtime and active model, and are invalidated on disconnect.
+
+**Accepted host limitation (#479):** in the compatibility pin's
+`tui_gateway/methods_config_set.py`, `_set_reasoning` and `_set_fast` fall back to
+writing Profile config if the runtime disappears, even with `scope: session`.
+The maintainer explicitly accepted this race to enable parity with Cadu. A client
+preflight cannot eliminate it; the host must eventually reject stale runtimes.
+This is not authorization to deliberately write Profile defaults.
+
+`session.cwd.set` accepts `{session_id, profile, cwd}` while idle and returns
+`cwd`; the displayed workspace changes only after acknowledgment. It can be
+changed back through the same picker. `session.control.read` returns `control`
+with optional `goal`, `loop` and `heartbeat` records. The phone exposes only
+pause/resume for known active/paused states, confirms their consequences, and
+uses `session.control`'s returned snapshot. Unknown states are read-only;
+unsupported/denied methods become unavailable. No raw configuration editor,
+control creation, clearing, gate execution or general slash runner is exposed.
+
+The resume snapshot's `info.usage` maps `context_used`/`context_max` and cumulative
+`input`/`output` into the shared context presentation. Missing current-context
+fields show the same disabled “–” ring as Sessions; cumulative input never substitutes for context used.
+No cost, compression threshold or usage breakdown is invented. This slice does
+not call `session.context_breakdown`, which can rebuild the host's prompt merely
+to inspect it.
+
+The contract was checked against the source named by `HERMES_AGENT_TESTED_SHA`:
+`methods_complete.py::model.options`, `inventory.py::build_model_options_payload`,
+`server.py::_session_info`, `methods_config_set.py::_set_model`,
+`model_switch.py::parse_model_switch_args`, `methods_session.py::session.cwd.set`
+and `methods_session_control.py::session.control.read/control`. No live host
+mutation was used. Socket dispatch, read completion and confirmations all validate
+the captured context; disconnect invalidates them and never retries a write.
+Older snapshots cannot overwrite an acknowledged workspace change. Rejections
+keep the previous value and preserve the host's error text.

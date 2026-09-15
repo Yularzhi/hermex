@@ -30,6 +30,7 @@ import Observation
     private(set) var messages: [ChatMessage] = []
     private(set) var liveMessages: [ChatMessage] = []
     private(set) var errorMessage: String?
+    let chatControls = BotChatControls()
     let attachments: BotAttachmentDraft
     private(set) var draft = ""
     private(set) var uncertainSend = false
@@ -63,6 +64,11 @@ import Observation
     private var snapshotDirty = false
     private var fullSnapshotNeeded = false
     private var refreshTask: Task<Void, Never>?
+    private var reconnectTask: Task<Void, Never>?
+    private var isActive = false
+    private var shouldRetryConnection = false
+    private let reconnectDelay: (Duration) async throws -> Void
+    private(set) var isReconnecting = false
     private var stopAcknowledged = false
     private var promptReceiptPersistsWhileIdle = false
     private var localOperation = false
@@ -72,8 +78,10 @@ import Observation
 
     init(server: URL, connection: BotConnection, profile: BotProfile,
          wire: (any BotTransport)? = nil, drafts: ChatDraftStore? = nil,
-         attachmentCopies: any ChatDraftAttachmentStoring = ChatDraftAttachmentStore.shared) {
+         attachmentCopies: any ChatDraftAttachmentStoring = ChatDraftAttachmentStore.shared,
+         reconnectDelay: @escaping (Duration) async throws -> Void = { try await Task.sleep(for: $0) }) {
         self.server = server; self.connection = connection; self.profile = profile
+        self.reconnectDelay = reconnectDelay
         self.wire = wire ?? BotClient(connection: connection)
         self.drafts = drafts ?? .shared
         self.attachments = BotAttachmentDraft(key: .bot(server: server, connectionID: connection.id, profile: profile.id),
@@ -124,12 +132,6 @@ import Observation
 
     var mayEditDraft: Bool { hydrated && !localOperation }
 
-    /// An ambiguous earlier write requires confirmation, not a locked editor.
-    var mayConfirmHeldSubmission: Bool {
-        uncertainSend && mayEditDraft && connectionState == .connected
-            && !uncertainStop && !attachments.isImporting && answeringRequestID == nil
-    }
-
     /// The one request blocking this conversation. A clarify or approval wins over
     /// a stream request: it is the outer blocker, and the host resolves the inner
     /// one on its own deadline either way.
@@ -169,6 +171,12 @@ import Observation
 
     func recover() async {
         suspend()
+        isActive = true
+        await recoverConnection()
+    }
+
+    private func recoverConnection() async {
+        resetConnection()
         let owner = generation
         connectionState = .recovering
         errorMessage = nil
@@ -182,6 +190,9 @@ import Observation
                 try check(owner)
                 hydrated = true
             }
+            // Recovered text and attachments are an ordinary editable draft.
+            // Clearing this local marker never retries the earlier prompt.
+            if uncertainSend { try await releasePromptMarker(owner: owner) }
             try await wire.connect()
             try check(owner)
             let lookup = try await request("session.list", ["profile": .string(profile.id), "title": .string("Bot Chat"), "include_hidden": .bool(true)], owner: owner)
@@ -206,7 +217,14 @@ import Observation
             let current = try await request("session.resume", resumeParams(), owner: owner)
             try applySnapshot(current, full: true)
             try check(owner)
+            let controlsContext = BotChatControls.Context(connectionID: connection.id, profile: profile.id,
+                                                          runtime: foundRuntime, generation: owner)
+            await chatControls.connect(controlsContext, wire: wire)
+            try check(owner)
+            guard connectionState == .recovering, chatControls.context == controlsContext else { throw BotFailure.transport }
+            chatControls.snapshot(current["info"], idle: [.idle, .interrupted].contains(turn))
             connectionState = .connected
+            shouldRetryConnection = false
             scheduleRefresh()
         } catch {
             guard owner == generation, !Task.isCancelled else { return }
@@ -289,7 +307,7 @@ import Observation
         return true
     }
 
-    private func applySnapshot(_ snapshot: BotJSON, full: Bool) throws {
+    private func applySnapshot(_ snapshot: BotJSON, full: Bool, settingsRevision: Int? = nil) throws {
         guard snapshot["session_id"].text == runtime, snapshot["session_key"].text == tip,
               let running = snapshot["running"].flag, snapshot["hydrating"].flag != true else { throw BotFailure.unsupported }
         if let value = snapshot["info"]["profile_name"].text, value != profile.id { throw BotFailure.wrongIdentity }
@@ -338,6 +356,9 @@ import Observation
         else if running || continuation || queued { turn = .running }
         else if inflight["error"] != .null || snapshot["status"].text == "interrupted" { turn = .interrupted }
         else { turn = .idle }
+        if settingsRevision == nil || settingsRevision == chatControls.snapshotRevision {
+            chatControls.snapshot(snapshot["info"], idle: !busy)
+        }
     }
 
     /// Installs the snapshot's pending approval or question. A clarify outranks an
@@ -463,7 +484,7 @@ import Observation
                     errorMessage = String(localized: "The work changed before this message could be sent. Choose an action again.")
                 }
                 refreshAfterPrompt()
-            } else { disconnected(error) }
+            } else { disconnected(safe ? error : BotFailure.transport) }
         }
     }
 
@@ -707,46 +728,6 @@ import Observation
         }
     }
 
-    /// Explicit recovery preserves the draft without retrying an ambiguous write.
-    func restoreUncertainSubmission() async {
-        guard uncertainSend, connectionState == .connected, !localOperation else { return }
-        let owner = generation
-        localOperation = true
-        defer { if owner == generation { localOperation = false } }
-        do {
-            try await releasePromptMarker(owner: owner)
-            errorMessage = nil
-            await recover()
-        } catch {
-            if owner == generation {
-                errorMessage = String(localized: "Could not save the draft. The held message is still unresolved.")
-            }
-        }
-    }
-
-    /// Explicitly discard a held ambiguous prompt after the user checks Desktop.
-    /// The old text is never restored to the sendable composer.
-    func discardUncertainSubmission() async {
-        guard uncertainSend, connectionState == .connected, !localOperation else { return }
-        let owner = generation
-        drafts.setDraft("", for: draftKey)
-        drafts.setAttachments([], for: draftKey)
-        drafts.setBotSubmissionUncertain(false, for: draftKey)
-        do {
-            try await drafts.flush()
-            try check(owner)
-            draft = ""; uncertainSend = false
-            await attachments.consumed()
-            try check(owner)
-            await recover()
-        } catch {
-            if owner == generation {
-                drafts.setBotSubmissionUncertain(true, for: draftKey)
-                errorMessage = String(localized: "Could not save the draft. The held message is still unresolved.")
-            }
-        }
-    }
-
     private func observe(_ event: BotJSON) {
         guard connectionState != .disconnected, event["session_id"].text == runtime, runtime != nil else { return }
         guard let next = event["seq"].integer, next > 0 else {
@@ -767,6 +748,9 @@ import Observation
         }
         sequence = next
         let type = event["type"].text ?? ""
+        if ["session.info", "message.start", "message.complete", "session.control.update"].contains(type) {
+            chatControls.refresh()
+        }
         let streamRequestChanged = applyStreamRequest(type: type, payload: event["payload"])
         // Activity events never change the inflight text, so a continuous stream
         // during known work updates local state without another snapshot read.
@@ -816,8 +800,9 @@ import Observation
                     self.snapshotDirty = false
                     let full = self.fullSnapshotNeeded
                     self.fullSnapshotNeeded = false
+                    let settingsRevision = self.chatControls.snapshotRevision
                     let reply = try await self.request("session.resume", self.resumeParams(full: full), owner: owner)
-                    try self.applySnapshot(reply, full: full)
+                    try self.applySnapshot(reply, full: full, settingsRevision: settingsRevision)
                     if self.snapshotDirty { try await Task.sleep(for: .milliseconds(250)) }
                 }
                 self.refreshTask = nil
@@ -830,6 +815,7 @@ import Observation
     }
 
     private func disconnected(_ error: Error) {
+        chatControls.disconnect()
         wire.close()
         refreshTask?.cancel(); refreshTask = nil
         // A stream request lives only in the stream, so a lost socket makes its
@@ -838,10 +824,47 @@ import Observation
         connectionState = .disconnected
         turn = uncertainSend || uncertainStop ? .uncertain : .unknown
         turnRevision += 1
-        errorMessage = (error as? BotFailure ?? .transport).localizedDescription
+        let failure = error as? BotFailure ?? .transport
+        switch failure {
+        case .transport: shouldRetryConnection = true
+        case .rejected(let code): shouldRetryConnection = [408, 429].contains(code) || (500...599).contains(code)
+        default: shouldRetryConnection = false
+        }
+        errorMessage = shouldRetryConnection ? nil : failure.localizedDescription
+        scheduleReconnect()
+    }
+
+    /// Reattach to canonical host state while this screen is active. Commands
+    /// remain held; recovery never resends a prompt, answer, stop or setting.
+    private func scheduleReconnect() {
+        guard isActive, shouldRetryConnection, reconnectTask == nil else { return }
+        isReconnecting = true
+        let delay = reconnectDelay
+        reconnectTask = Task { [weak self] in
+            var seconds = 1
+            while !Task.isCancelled {
+                do { try await delay(.seconds(seconds)) } catch { return }
+                guard let self, self.isActive, self.shouldRetryConnection, !Task.isCancelled else { return }
+                await self.recoverConnection()
+                guard !Task.isCancelled else { return }
+                if !self.shouldRetryConnection || self.connectionState == .connected {
+                    self.isReconnecting = false; self.reconnectTask = nil
+                    return
+                }
+                seconds = min(seconds * 2, 30)
+            }
+        }
     }
 
     func suspend() {
+        isActive = false; shouldRetryConnection = false; isReconnecting = false
+        reconnectTask?.cancel(); reconnectTask = nil
+        resetConnection()
+        Task { try? await drafts.flush() }
+    }
+
+    private func resetConnection() {
+        chatControls.disconnect()
         attachmentUploadTask?.cancel(); attachmentUploadTask = nil; isUploadingAttachments = false
         attachments.cancelImport()
         generation += 1; turnRevision += 1
@@ -850,6 +873,5 @@ import Observation
         localOperation = false; submittingPrompt = nil
         streamRequest = nil; answeringRequestID = nil
         connectionState = .disconnected; turn = .unknown
-        Task { try? await drafts.flush() }
     }
 }

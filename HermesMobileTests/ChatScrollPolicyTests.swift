@@ -46,6 +46,27 @@ final class ChatScrollPolicyTests: XCTestCase {
         XCTAssertFalse(ChatScrollPolicy.isNearBottom(distanceFromBottom: 161, isStreaming: true))
     }
 
+    func testLatestArrowHidesAtBottomEvenWhenFollowingIsPaused() {
+        for streaming in [false, true] {
+            let isNearBottom = ChatScrollPolicy.isNearBottom(distanceFromBottom: 0, isStreaming: streaming)
+            XCTAssertFalse(ChatScrollPolicy.showsScrollToBottomButton(
+                isNearBottom: isNearBottom, isStreaming: streaming, isFollowing: false
+            ))
+        }
+    }
+
+    func testLatestArrowUsesTheSameIdleAndStreamingThresholds() {
+        for (distance, streaming, following, visible) in [
+            (80.0, false, false, false), (81, false, false, true),
+            (120, true, false, false), (161, true, false, true), (161, true, true, false)
+        ] {
+            let isNearBottom = ChatScrollPolicy.isNearBottom(distanceFromBottom: distance, isStreaming: streaming)
+            XCTAssertEqual(ChatScrollPolicy.showsScrollToBottomButton(
+                isNearBottom: isNearBottom, isStreaming: streaming, isFollowing: following
+            ), visible)
+        }
+    }
+
     // MARK: Follow latch
 
     private typealias Latch = ChatScrollPolicy.FollowLatch

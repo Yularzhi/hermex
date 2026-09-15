@@ -124,7 +124,7 @@ import UIKit
         model.suspend()
     }
 
-    func testUnknownPromptOutcomeRetainsCopiesAndMarkerAcrossRelaunch() async throws {
+    func testUnknownPromptOutcomeRestoresCopiesAcrossRelaunch() async throws {
         let copies = BotAttachmentCopies(); let persistence = BotMemoryDrafts(); let drafts = store(persistence)
         let wire = BotFixtureWire(); let id = UUID()
         let model = make(wire, connectionID: id, drafts: drafts, copies: copies); await model.recover()
@@ -134,15 +134,13 @@ import UIKit
         await model.send(); model.suspend()
         let restored = make(BotFixtureWire(), connectionID: id, drafts: store(persistence), copies: copies)
         await restored.recover()
-        XCTAssertTrue(restored.uncertainSend); XCTAssertNil(restored.preparePrompt(.send))
+        XCTAssertFalse(restored.uncertainSend); XCTAssertNotNil(restored.preparePrompt(.send))
         XCTAssertEqual(restored.attachments.items.count, 1)
-        await restored.discardUncertainSubmission()
-        XCTAssertTrue(restored.attachments.items.isEmpty)
-        let count = await copies.count; XCTAssertEqual(count, 0)
+        let count = await copies.count; XCTAssertEqual(count, 1)
         restored.suspend()
     }
 
-    func testRestoreHeldDraftPreservesAttachmentsAndDoesNotResend() async throws {
+    func testAutomaticDraftRecoveryPreservesAttachmentsAndDoesNotResend() async throws {
         let copies = BotAttachmentCopies(); let persistence = BotMemoryDrafts()
         let wire = BotFixtureWire(); let id = UUID()
         let model = make(wire, connectionID: id, drafts: store(persistence), copies: copies)
@@ -154,7 +152,6 @@ import UIKit
         let restoredWire = BotFixtureWire()
         let restored = make(restoredWire, connectionID: id, drafts: store(persistence), copies: copies)
         await restored.recover()
-        await restored.restoreUncertainSubmission()
         XCTAssertFalse(restored.uncertainSend)
         XCTAssertNotNil(restored.preparePrompt(.send))
         XCTAssertEqual(restored.draft, "Test")

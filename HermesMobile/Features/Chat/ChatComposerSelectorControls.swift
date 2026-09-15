@@ -102,6 +102,8 @@ struct ComposerProfileSelectorMenu: View {
 }
 
 struct ComposerModelEffortMenu: View {
+    /// Allows a caller to disable effort while retaining access to the model menu.
+    var allowsEffortChanges = true
     let selection: ComposerModelEffortSelection
     let modelGroups: [ModelCatalogGroup]
     let favoriteModelKeys: [ModelFavoriteKey]
@@ -199,6 +201,7 @@ struct ComposerModelEffortMenu: View {
             children: selection.effortOptions.map { option in
                 UIAction(
                     title: option.title,
+                    attributes: allowsEffortChanges ? [] : [.disabled],
                     state: selection.committedEffort == option.id ? .on : .off
                 ) { _ in
                     Task { @MainActor in

@@ -1,6 +1,8 @@
 import SwiftUI
 
 struct ComposerWorkspacePickerSheet: View {
+    /// Direct-Hermes validates a typed path itself; webui uses trusted suggestions.
+    var allowsCustomPath = false
     let workspaceRoots: [WorkspaceRoot]
     let selectedWorkspacePath: String?
     let suggestions: [String]
@@ -26,7 +28,15 @@ struct ComposerWorkspacePickerSheet: View {
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
                 } footer: {
-                    Text("Suggestions are limited to trusted workspace roots from the server.")
+                    if allowsCustomPath {
+                        Text("Change the working directory for this chat. The host must accept the path before it changes.")
+                    } else {
+                        Text("Suggestions are limited to trusted workspace roots from the server.")
+                    }
+                }
+
+                if allowsCustomPath, !prefix.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    Section { workspaceButton(path: prefix.trimmingCharacters(in: .whitespacesAndNewlines), name: nil) }
                 }
 
                 if let effectiveSelectedWorkspacePath, !effectiveSelectedWorkspacePath.isEmpty {

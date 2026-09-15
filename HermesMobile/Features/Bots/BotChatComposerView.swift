@@ -7,7 +7,6 @@ struct BotChatComposerView: View {
     let model: BotConversation
     let onStop: () -> Void
     let onReconnect: () -> Void
-    let onResolveHeldMessage: () -> Void
     /// Scrolls the transcript back to the pending request card.
     let onShowRequest: () -> Void
 
@@ -26,15 +25,15 @@ struct BotChatComposerView: View {
     @State private var measuredHeight: CGFloat = 0
     @State private var keyboardIsVisible = false
 
+    @State private var settingsPresented = false
     @State private var mode = BotPromptMode.send
-    @State private var confirmingHeldSend = false
     @State private var redirectAction: BotConversation.PromptAction?
 
-    private var isExpanded: Bool { isFocused || picker != nil || shouldRestoreFocusAfterPicker || preview != nil || model.submittingPrompt != nil }
+    private var isExpanded: Bool { isFocused || settingsPresented || picker != nil || shouldRestoreFocusAfterPicker || preview != nil || model.submittingPrompt != nil }
     private var showsToolbar: Bool { isExpanded || mode != .send }
     private var showsStop: Bool { model.mayStop || model.turn == .stopping }
     private var canSend: Bool {
-        (model.maySubmit(mode) || model.mayConfirmHeldSubmission) && (!model.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !model.attachments.items.isEmpty)
+        model.maySubmit(mode) && (!model.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !model.attachments.items.isEmpty)
     }
     private var appearance: ChatComposerActionAppearance {
         ChatComposerActionAppearance(
@@ -48,7 +47,7 @@ struct BotChatComposerView: View {
             VStack(spacing: 0) {
                 BotChatStatusView(
                     model: model, onReconnect: onReconnect,
-                    onResolveHeldMessage: onResolveHeldMessage, onShowRequest: onShowRequest
+                    onShowRequest: onShowRequest
                 )
 
                 if mode != .send && model.maySend {
@@ -58,6 +57,16 @@ struct BotChatComposerView: View {
                         .padding(.horizontal, 16).padding(.bottom, 8)
                 }
 
+                if let error = model.chatControls.errorMessage {
+                    Text(error).font(AppFont.footnote()).foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 16).padding(.bottom, 6)
+                }
+                if let pending = model.chatControls.pendingModel {
+                    Text("Next turn: \(pending.displayName)").font(AppFont.footnote()).foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 16).padding(.bottom, 6)
+                }
                 if let error = model.attachments.errorMessage {
                     Text(error).font(AppFont.footnote()).foregroundStyle(.secondary)
                         .frame(maxWidth: .infinity, alignment: .leading)
@@ -74,7 +83,10 @@ struct BotChatComposerView: View {
                     HStack(alignment: .center, spacing: 8) {
                         ComposerToolbarScroller {
                             plusMenu
-                            modeMenu
+                            if model.mayGuide || mode != .send { modeMenu }
+                            BotComposerSettings(settings: model.chatControls, preparePresentation: {
+                                settingsPresented = true; isFocused = false
+                            }, dismissPresentation: { settingsPresented = false })
                         }
                         promptButtons
                     }
@@ -94,6 +106,21 @@ struct BotChatComposerView: View {
             .animation(ChatMotion.composerChrome(reduceMotion: reduceMotion), value: isExpanded)
         }
         .modifier(BotAttachmentPickerPresentation(model: model, picker: $picker))
+        .confirmationDialog("Change chat model?", isPresented: Binding(
+            get: { model.chatControls.confirmation != nil },
+            set: { if !$0 { model.chatControls.cancelConfirmation() } }
+        ), titleVisibility: .visible) {
+            if let confirmation = model.chatControls.confirmation {
+                Button("Change model") {
+                    model.chatControls.cancelConfirmation()
+                    Task { await model.chatControls.apply(confirmation.action, confirmed: true) }
+                }
+                .disabled(!model.chatControls.mayChangeModel)
+            }
+            Button("Cancel", role: .cancel) { model.chatControls.cancelConfirmation() }
+        } message: {
+            if let confirmation = model.chatControls.confirmation { Text(confirmation.message) }
+        }
         .sheet(item: $preview) { item in
             BotArtifactPreview(reference: TranscriptMediaReference(rawReference: item.name)) {
                 try await model.attachments.data(for: item)
@@ -116,21 +143,6 @@ struct BotChatComposerView: View {
             if busy && mode == .send { mode = model.attachments.items.isEmpty ? .steer : .queue }
         }
         .onAppear { if model.mayGuide && mode == .send { mode = model.attachments.items.isEmpty ? .steer : .queue } }
-        .confirmationDialog("Send this draft?", isPresented: $confirmingHeldSend, titleVisibility: .visible) {
-            Button("Send draft") {
-                Task {
-                    await model.restoreUncertainSubmission()
-                    guard !model.uncertainSend else { return }
-                    let nextMode: BotPromptMode = model.maySend ? .send : .queue
-                    guard let action = model.preparePrompt(nextMode) else { return }
-                    mode = nextMode
-                    await model.submit(action)
-                }
-            }
-            Button("Cancel", role: .cancel) {}
-        } message: {
-            Text("The previous send was not confirmed. Sending this draft could duplicate it if the bot already received it.")
-        }
         .confirmationDialog("Redirect this bot's current work?", isPresented: Binding(
             get: { redirectAction != nil }, set: { if !$0 { redirectAction = nil } }
         ), titleVisibility: .visible) {
@@ -176,7 +188,7 @@ struct BotChatComposerView: View {
                     onPasteImageProviders: { BotAttachmentPaste.providers($0, model: model) },
                     onPasteImages: { BotAttachmentPaste.images($0, model: model) },
                     onTapChip: { _ in }, onTapQuote: { _ in }, onRemoveQuote: { _ in },
-                    placeholder: String(localized: "Message bot"), acceptsAttachments: model.mayEditDraft
+                    placeholder: String(localized: "Ask anything..."), acceptsAttachments: model.mayEditDraft
                 )
                 if !isExpanded {
                     ComposerAttachmentPillPreview(attachments: model.attachments.items, onPreview: { preview = $0 })
@@ -283,10 +295,6 @@ struct BotChatComposerView: View {
     }
 
     private func send() {
-        if model.mayConfirmHeldSubmission {
-            confirmingHeldSend = true
-            return
-        }
         guard let action = model.preparePrompt(mode) else { return }
         if mode == .redirect { redirectAction = action }
         else { Task { await model.submit(action) } }
@@ -298,11 +306,10 @@ struct BotChatComposerView: View {
 private struct BotChatStatusView: View {
     let model: BotConversation
     let onReconnect: () -> Void
-    let onResolveHeldMessage: () -> Void
     let onShowRequest: () -> Void
 
     var body: some View {
-        if model.connectionState != .connected || model.turn != .idle || model.errorMessage != nil || model.uncertainSend
+        if connectionText != nil || (model.connectionState == .connected && model.turn != .idle) || model.errorMessage != nil
             || model.promptReceipt != nil || !model.liveActivity.notices.isEmpty || !model.liveActivity.memoryNotes.isEmpty {
             VStack(alignment: .leading, spacing: 6) {
                 if let connectionText { Text(connectionText) }
@@ -321,11 +328,6 @@ private struct BotChatStatusView: View {
                     }
                 } else if model.submittingPrompt != nil {
                     Text("Sending…")
-                } else if model.uncertainSend {
-                    Text("The previous send was not confirmed. You can edit this draft and try sending again.")
-                    if model.connectionState == .connected {
-                        Button("Resolve held message…", action: onResolveHeldMessage)
-                    }
                 } else if model.turn == .needsAttention {
                     // The model ranks a pending request above an unresolved Stop, so
                     // the actionable line wins here too. The card is in the transcript
@@ -343,7 +345,7 @@ private struct BotChatStatusView: View {
                 } else if model.connectionState == .connected, let turnText {
                     Text(turnText)
                 }
-                if model.connectionState == .disconnected {
+                if model.connectionState == .disconnected && !model.isReconnecting && model.errorMessage != nil {
                     Button("Reconnect", action: onReconnect)
                 }
             }
@@ -366,10 +368,11 @@ private struct BotChatStatusView: View {
     }
 
     private var connectionText: String? {
+        guard !model.isReconnecting else { return nil }
         switch model.connectionState {
         case .connected: return nil
         case .recovering: return String(localized: "Loading current conversation…")
-        case .disconnected: return String(localized: "Disconnected · Last loaded conversation")
+        case .disconnected: return nil
         }
     }
 
@@ -379,7 +382,7 @@ private struct BotChatStatusView: View {
         case .running: return model.workStatus ?? String(localized: "Working")
         case .submitting: return String(localized: "Sending…")
         case .stopping: return String(localized: "Stopping…")
-        case .uncertain: return String(localized: "Outcome unknown")
+        case .uncertain: return model.uncertainStop ? String(localized: "Outcome unknown") : nil
         case .interrupted: return String(localized: "Work was interrupted. The saved conversation is loaded.")
         case .unknown: return String(localized: "Checking current work…")
         }

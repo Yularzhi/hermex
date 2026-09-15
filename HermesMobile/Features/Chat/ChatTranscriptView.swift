@@ -847,7 +847,7 @@ private struct ChatTranscriptMessageRow: View {
     }
 }
 
-private struct ChatScrollToBottomButton: View {
+struct ChatScrollToBottomButton: View {
     @Environment(\.colorScheme) private var colorScheme
 
     let bottomPadding: CGFloat

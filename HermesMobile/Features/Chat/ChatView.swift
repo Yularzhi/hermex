@@ -1542,7 +1542,10 @@ struct ChatView: View {
     }
 
     private var showsScrollToBottomButton: Bool {
-        !isScrolledNearBottom && (viewModel.activeStreamID == nil || !shouldFollowLatestMessage)
+        ChatScrollPolicy.showsScrollToBottomButton(
+            isNearBottom: isScrolledNearBottom,
+            isStreaming: viewModel.activeStreamID != nil, isFollowing: shouldFollowLatestMessage
+        )
     }
 
     private var workingRowStartedAt: Date? {

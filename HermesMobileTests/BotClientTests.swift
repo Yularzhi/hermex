@@ -144,6 +144,53 @@ import XCTest
         client.close()
     }
 
+    func testSettingsAllowlistRejectsUnscopedWritesAndPreservesHostError() async throws {
+        BotHTTPFixture.handler = { request in
+            switch request.url!.path {
+            case "/api/status": return (200, .object(["auth_required": .bool(true), "auth_providers": .array([.string("basic")])]))
+            case "/auth/password-login": return (200, .object([:]))
+            case "/api/auth/me": return (200, .object(["provider": .string("basic")]))
+            case "/api/auth/ws-ticket": return (200, .object(["ticket": .string("ticket")]))
+            default: return (404, .null)
+            }
+        }
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [BotHTTPFixture.self]
+        let socket = BotScriptedSocket()
+        socket.reply = { request in
+            .object(["id": request["id"], "error": .object(["code": .number(4002), "message": .string("Provider unavailable")])])
+        }
+        let client = BotClient(connection: connection(), configuration: configuration) { _, _ in socket }
+        try await client.connect()
+        defer { client.close() }
+        for key in ["reasoning", "fast", "model"] {
+            do {
+                _ = try await client.call("config.set", ["key": .string(key), "value": .string("high"), "session_id": .string("runtime")])
+                XCTFail("Only explicit session settings are supported")
+            } catch { XCTAssertEqual(error as? BotFailure, .unsupported) }
+        }
+        XCTAssertTrue(socket.sentRequests.isEmpty)
+        do {
+            _ = try await client.call("config.set", ["key": .string("model"), "value": .string("model --provider provider --session"), "scope": .string("session"), "session_id": .string("runtime")])
+            XCTFail("Rejected setting succeeded")
+        } catch {
+            XCTAssertEqual(error.localizedDescription, "Provider unavailable")
+        }
+        for (key, value) in [("reasoning", "none"), ("reasoning", "ultra"), ("fast", "normal"), ("fast", "fast")] {
+            do {
+                _ = try await client.call("config.set", ["key": .string(key), "value": .string(value), "scope": .string("session"), "session_id": .string("runtime")])
+                XCTFail("Rejected setting succeeded")
+            } catch { XCTAssertEqual(error.localizedDescription, "Provider unavailable") }
+        }
+        for (key, value) in [("reasoning", "off"), ("reasoning", "show"), ("fast", "toggle"), ("yolo", "on")] {
+            do {
+                _ = try await client.call("config.set", ["key": .string(key), "value": .string(value), "scope": .string("session"), "session_id": .string("runtime")])
+                XCTFail("Unsupported setting was dispatched")
+            } catch { XCTAssertEqual(error as? BotFailure, .unsupported) }
+        }
+        XCTAssertEqual(socket.sentRequests.count, 5)
+    }
+
     func testStatusWithoutVersionStillConnectsAndShowsNoNote() async throws {
         BotHTTPFixture.handler = { request in
             switch request.url!.path {
@@ -258,6 +305,7 @@ private final class BotScriptedSocket: BotSocket, @unchecked Sendable {
     ]
     private var waiter: CheckedContinuation<URLSessionWebSocketTask.Message, Error>?
     private var closed = false
+    var reply: ((BotJSON) -> BotJSON)?
     var withholdReply: ((BotJSON) -> Bool)?
     private(set) var sentTextFrames = 0
     private(set) var sentRequests: [BotJSON] = []
@@ -274,7 +322,7 @@ private final class BotScriptedSocket: BotSocket, @unchecked Sendable {
         let request = try JSONDecoder().decode(BotJSON.self, from: Data(text.utf8))
         record(request)
         if withholdReply?(request) == true { return }
-        let response = BotJSON.object(["id": request["id"], "result": .object(["profiles": .array([])])])
+        let response = reply?(request) ?? BotJSON.object(["id": request["id"], "result": .object(["profiles": .array([])])])
         let frame = URLSessionWebSocketTask.Message.string(String(decoding: try JSONEncoder().encode(response), as: UTF8.self))
         enqueue(frame)
     }

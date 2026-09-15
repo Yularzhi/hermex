@@ -11,9 +11,90 @@ import Vision
     }
     private var profile: BotProfile { BotProfile(.object(["name": .string("inbox-triage")]))! }
 
-    private func make(_ wire: BotFixtureWire, drafts: ChatDraftStore? = nil) -> BotConversation {
+    private func make(_ wire: BotFixtureWire, drafts: ChatDraftStore? = nil, reconnectDelay: @escaping (Duration) async throws -> Void = { try await Task.sleep(for: $0) }) -> BotConversation {
         BotConversation(server: server, connection: connection, profile: profile, wire: wire,
-                        drafts: drafts ?? ChatDraftStore(persistence: BotMemoryDrafts(), debounceDuration: .seconds(60)))
+                        drafts: drafts ?? ChatDraftStore(persistence: BotMemoryDrafts(), debounceDuration: .seconds(60)), reconnectDelay: reconnectDelay)
+    }
+
+    func testTransientDisconnectAutomaticallyRecoversWithoutResending() async {
+        for failure in [BotFailure.transport, .rejected(503), .rejected(429)] {
+            let wire = BotFixtureWire()
+            let model = make(wire, reconnectDelay: { _ in })
+            await model.recover()
+            model.editDraft("Keep this unsent")
+            let connected = expectation(description: "Automatically reconnected")
+            wire.onDisconnect?(failure)
+            withObservationTracking { _ = model.isReconnecting } onChange: { connected.fulfill() }
+            await fulfillment(of: [connected], timeout: 3)
+            XCTAssertEqual(model.connectionState, .connected)
+            XCTAssertNil(model.errorMessage)
+            XCTAssertEqual(model.draft, "Keep this unsent")
+            XCTAssertEqual(wire.connectCount, 2)
+            XCTAssertFalse(wire.calls.contains { ["prompt.submit", "session.steer", "session.redirect", "config.set"].contains($0.0) })
+            model.suspend()
+        }
+    }
+
+    func testLostSendAutomaticallyRestoresDraftWithoutResending() async {
+        let waiting = expectation(description: "Automatic recovery scheduled")
+        var release: CheckedContinuation<Void, Never>?
+        let wire = BotFixtureWire()
+        let model = make(wire, reconnectDelay: { _ in
+            await withCheckedContinuation { release = $0; waiting.fulfill() }
+        })
+        await model.recover(); model.editDraft("Restore automatically")
+        wire.submitFailure = .transport
+        await model.send()
+        await fulfillment(of: [waiting], timeout: 3)
+        let recovered = expectation(description: "Draft restored by automatic recovery")
+        withObservationTracking { _ = model.isReconnecting } onChange: { recovered.fulfill() }
+        release?.resume()
+        await fulfillment(of: [recovered], timeout: 3)
+        XCTAssertEqual(model.connectionState, .connected)
+        XCTAssertFalse(model.uncertainSend)
+        XCTAssertTrue(model.maySend)
+        XCTAssertNil(model.errorMessage)
+        XCTAssertEqual(model.draft, "Restore automatically")
+        XCTAssertEqual(wire.calls.filter { $0.0 == "prompt.submit" }.count, 1)
+        model.suspend()
+    }
+
+    func testSuspendingCancelsPendingAutomaticReconnect() async {
+        let waiting = expectation(description: "Reconnect delay started")
+        let finished = expectation(description: "Reconnect delay released")
+        var release: CheckedContinuation<Void, Never>?
+        let wire = BotFixtureWire()
+        let model = make(wire, reconnectDelay: { _ in
+            await withCheckedContinuation { release = $0; waiting.fulfill() }
+            finished.fulfill()
+        })
+        await model.recover()
+        wire.onDisconnect?(BotFailure.transport)
+        await fulfillment(of: [waiting], timeout: 3)
+        model.suspend()
+        release?.resume()
+        await fulfillment(of: [finished], timeout: 3)
+        XCTAssertFalse(model.isReconnecting)
+        XCTAssertEqual(wire.connectCount, 1)
+        XCTAssertEqual(model.connectionState, .disconnected)
+    }
+
+    func testReconnectBacksOffAndStopsForAnAuthenticationFailure() async {
+        let wire = BotFixtureWire()
+        var delays: [Duration] = []
+        let model = make(wire, reconnectDelay: { delay in
+            delays.append(delay)
+            wire.lookupFailure = delays.count < 7 ? .transport : .rejected(401)
+        })
+        await model.recover()
+        let stopped = expectation(description: "Authentication needs user action")
+        wire.onDisconnect?(BotFailure.transport)
+        withObservationTracking { _ = model.isReconnecting } onChange: { stopped.fulfill() }
+        await fulfillment(of: [stopped], timeout: 3)
+        XCTAssertEqual(delays, [1, 2, 4, 8, 16, 30, 30].map { .seconds($0) })
+        XCTAssertEqual(model.connectionState, .disconnected)
+        XCTAssertEqual(model.errorMessage, BotFailure.rejected(401).localizedDescription)
+        model.suspend()
     }
 
     func testFailedDraftClearAfterAcknowledgmentKeepsTextDurablyHeld() async throws {
@@ -96,13 +177,14 @@ import Vision
             XCTAssertNil(model.submittingPrompt)
             XCTAssertEqual(model.draft, "once")
             await model.recover()
-            XCTAssertNil(model.preparePrompt(.steer))
+            XCTAssertFalse(model.uncertainSend)
+            XCTAssertNotNil(model.preparePrompt(.steer))
             XCTAssertEqual(wire.calls.filter { $0.0 == "session.steer" }.count, 1)
             model.suspend()
         }
     }
 
-    func testLostOrUnrecognizedPromptAcknowledgmentStaysHeldAcrossRecovery() async throws {
+    func testLostOrUnrecognizedPromptAcknowledgmentRestoresDraftAcrossRecovery() async throws {
         for reply in [BotJSON.null, .object(["status": .string("future")]), .object(["status": .string("redirected")])] {
             let wire = BotFixtureWire(); wire.running = true; wire.promptReply = reply
             let persistence = BotMemoryDrafts()
@@ -114,7 +196,8 @@ import Vision
             let persisted = await persistence.load()
             XCTAssertTrue(persisted[model.draftKey]?.botSubmissionUncertain == true)
             await model.recover()
-            XCTAssertNil(model.preparePrompt(.steer))
+            XCTAssertFalse(model.uncertainSend)
+            XCTAssertNotNil(model.preparePrompt(.steer))
             XCTAssertEqual(wire.calls.filter { $0.0 == "session.steer" }.count, 1)
             model.suspend()
         }
@@ -237,7 +320,7 @@ import Vision
         XCTAssertEqual(model.runtime, "runtime")
         XCTAssertTrue(model.maySend)
         XCTAssertEqual(model.messages.map(\.content), ["saved"])
-        XCTAssertEqual(wire.calls.map(\.0), ["session.list", "session.resume", "session.events.since", "session.resume"])
+        XCTAssertEqual(wire.calls.map(\.0), ["session.list", "session.resume", "session.events.since", "session.resume", "model.options", "session.control.read"])
         XCTAssertEqual(wire.calls[1].1["session_id"], .string("tip"))
         XCTAssertEqual(wire.calls[1].1["close_on_disconnect"], .bool(false))
         model.suspend()
@@ -298,15 +381,16 @@ import Vision
         XCTAssertTrue(model.uncertainSend)
         XCTAssertFalse(model.maySend)
         await model.recover()
-        await model.send()
+        XCTAssertFalse(model.uncertainSend)
+        XCTAssertTrue(model.maySend)
         XCTAssertEqual(wire.calls.filter { $0.0 == "prompt.submit" }.count, 1)
         let restoredWire = BotFixtureWire()
         let restored = BotConversation(server: server, connection: model.connection, profile: profile,
                                        wire: restoredWire, drafts: ChatDraftStore(persistence: persistence))
         await restored.recover()
-        XCTAssertTrue(restored.uncertainSend)
+        XCTAssertFalse(restored.uncertainSend)
         XCTAssertEqual(restored.draft, "only once")
-        XCTAssertFalse(restored.maySend)
+        XCTAssertTrue(restored.maySend)
         model.suspend(); restored.suspend()
     }
 
@@ -749,6 +833,7 @@ actor BotMemoryDrafts: ChatDraftPersisting {
     var todoState = BotJSON.null
     var history: [BotJSON] = [.object(["role": .string("assistant"), "text": .string("saved")])]
     var replay = BotFixtureWire.replay()
+    var settingsCall: ((String, [String: BotJSON]) -> BotJSON)?
     var lookupFailure: BotFailure?
     var submitFailure: BotFailure?
     var promptReply: BotJSON?
@@ -767,7 +852,8 @@ actor BotMemoryDrafts: ChatDraftPersisting {
         guard let downloadArtifact else { throw BotArtifactFailure.unavailable }
         return try await downloadArtifact(path, context)
     }
-    func connect() async throws {}
+    var connectCount = 0
+    func connect() async throws { connectCount += 1 }
     func close() {}
     func call(_ method: String, _ params: [String: BotJSON], validateDispatch: (() throws -> Void)?) async throws -> BotJSON {
         beforeDispatch?(method)
@@ -813,7 +899,9 @@ actor BotMemoryDrafts: ChatDraftPersisting {
         case "session.interrupt":
             if let stopFailure { throw stopFailure }
             return .object(["interrupted": .bool(true)])
-        default: throw BotFailure.unsupported
+        default:
+            if let settingsCall { return settingsCall(method, params) }
+            throw BotFailure.unsupported
         }
     }
     /// The gateway's `_approval_request_payload` shape, as it reaches both the

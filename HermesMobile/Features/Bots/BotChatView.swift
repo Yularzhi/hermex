@@ -8,10 +8,11 @@ import SwiftUI
     @Environment(\.scenePhase) private var scenePhase
     @State private var model: BotConversation
     @State private var stopAction: BotConversation.StopAction?
-    @State private var confirmingDiscard = false
     @State private var recoveryID = UUID()
-    @State private var followsLatest = true
-    @State private var isAtBottom = true
+    @State private var followLatch = ChatScrollPolicy.FollowLatch()
+    @State private var isNearBottom = true
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @AppStorage(AppHaptics.isEnabledKey) private var isHapticsEnabled = true
     /// Bumped by the status line's Review action; the transcript scrolls on change.
     @State private var showRequestID = UUID()
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
@@ -29,9 +30,6 @@ import SwiftUI
             ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 8) {
-                        if model.messages.isEmpty && model.liveMessages.isEmpty && model.connectionState == .connected {
-                            Text("No messages yet").foregroundStyle(.secondary)
-                        }
                         ForEach(model.messages) { message in
                             settledActivity(anchoredTo: message.id)
                             BotArtifactMessageView(message: message, model: model)
@@ -75,21 +73,15 @@ import SwiftUI
                     // A tapped row must stay under the finger: stop following so
                     // neither the size-change anchor nor the next activity update
                     // moves the reader. Latest brings them back.
-                    .environment(\.chatDisclosureToggled) { followsLatest = false }
+                    .environment(\.chatDisclosureToggled) { handleFollowEvent(.userScrollBegin) }
+                    .background {
+                        ChatScrollObserver(isStreaming: isStreaming, onFollowEvent: handleFollowEvent, onMetrics: updateScrollMetrics)
+                            .accessibilityHidden(true)
+                    }
                 }
                 .defaultScrollAnchor(ChatScrollPolicy.initialTranscriptAnchor, for: .initialOffset)
                 .defaultScrollAnchor(ChatScrollPolicy.sizeChangeAnchor(shouldFollowLatestMessage: followsLatest), for: .sizeChanges)
                 .scrollDismissesKeyboard(.interactively)
-                .onScrollGeometryChange(for: Bool.self) { geometry in
-                    geometry.contentOffset.y + geometry.containerSize.height
-                        >= geometry.contentSize.height + geometry.contentInsets.bottom - 48
-                } action: { _, atBottom in
-                    isAtBottom = atBottom
-                }
-                .onScrollPhaseChange { _, phase in
-                    if phase == .interacting { followsLatest = false }
-                    if phase == .idle && isAtBottom { followsLatest = true }
-                }
                 .onChange(of: model.messages.count) { followLatest(proxy) }
                 .onChange(of: model.liveMessages.last?.content) { followLatest(proxy) }
                 .onChange(of: model.liveActivity.toolCalls.count) { followLatest(proxy) }
@@ -98,18 +90,32 @@ import SwiftUI
                 // A request that needs the user wins over where they had scrolled.
                 .onChange(of: model.pendingRequest?.requestID) { _, id in
                     guard id != nil else { return }
-                    followsLatest = true
+                    handleFollowEvent(.reset)
                     proxy.scrollTo(BotChatView.requestAnchor, anchor: .bottom)
                 }
                 .onChange(of: showRequestID) { proxy.scrollTo(BotChatView.requestAnchor, anchor: .bottom) }
-                .overlay(alignment: .bottomTrailing) {
-                    if !followsLatest {
-                        Button("Latest", systemImage: "arrow.down") {
-                            followsLatest = true
-                            followLatest(proxy)
+                .overlay(alignment: .bottom) {
+                    if showsScrollToBottomButton {
+                        // The safe-area inset already keeps this above the composer.
+                        ChatScrollToBottomButton(bottomPadding: 12) {
+                            ChatHaptics.scrolledToLatest(isEnabled: isHapticsEnabled)
+                            handleFollowEvent(.reset)
+                            withAnimation(isStreaming ? nil : ChatMotion.scrollToLatest(reduceMotion: reduceMotion)) {
+                                followLatest(proxy)
+                            }
                         }
-                        .buttonStyle(.borderedProminent)
-                        .padding()
+                        .transition(ChatMotion.bottomOverlayTransition(reduceMotion: reduceMotion))
+                    }
+                }
+                .animation(ChatMotion.quickState(reduceMotion: reduceMotion), value: showsScrollToBottomButton)
+                .overlay {
+                    if model.messages.isEmpty && model.liveMessages.isEmpty && model.pendingRequest == nil && model.connectionState == .connected {
+                        ContentUnavailableView {
+                            Image(systemName: "bubble.left.and.bubble.right")
+                        } description: {
+                            Text("Send a message to start the conversation.")
+                        }
+                        .allowsHitTesting(false)
                     }
                 }
                 .safeAreaInset(edge: .bottom, spacing: 0) { composer }
@@ -117,6 +123,14 @@ import SwiftUI
         }
         .navigationTitle(model.profile.name)
         .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .principal) {
+                ChatToolbarTitleLabel(title: model.profile.name, subtitle: model.chatControls.workspace?.lastPathComponentFallback)
+            }
+            if !model.chatControls.controls.isEmpty {
+                ToolbarItem(placement: .topBarTrailing) { BotSessionControlMenu(settings: model.chatControls) }
+            }
+        }
         .task(id: recoveryID) {
             if scenePhase == .active { await model.recover() }
         }
@@ -137,16 +151,7 @@ import SwiftUI
         } message: {
             Text("This stops current work in this conversation, including work started in Desktop, clears queued prompts and denies pending approvals. It also stops host speech playback. A command already sent may reach later Desktop work.")
         }
-        .confirmationDialog("Resolve held message", isPresented: $confirmingDiscard, titleVisibility: .visible) {
-            Button("Restore draft") {
-                Task { await model.restoreUncertainSubmission() }
-            }
-            Button("Discard held message", role: .destructive) {
-                Task { await model.discardUncertainSubmission() }
-            }
-        } message: {
-            Text("Restore keeps your text and attachments and enables sending again. Nothing is sent automatically. Check the conversation before sending to avoid a duplicate. Discard removes the local draft.")
-        }
+
     }
 
     /// Which bot on which connection, so two hosts with equal Profile names
@@ -195,6 +200,32 @@ import SwiftUI
         }
     }
 
+    private var followsLatest: Bool { followLatch.isFollowing }
+
+    private func handleFollowEvent(_ event: ChatScrollPolicy.FollowEvent) {
+        let resolved = ChatScrollPolicy.resolveFollow(current: followLatch, event: event)
+        if resolved != followLatch { followLatch = resolved }
+    }
+
+    private func updateScrollMetrics(_ metrics: ChatScrollMetrics) {
+        let wasNearBottom = isNearBottom
+        isNearBottom = ChatScrollPolicy.isNearBottom(distanceFromBottom: metrics.distanceFromBottom, isStreaming: isStreaming)
+        handleFollowEvent(.contentScrolled(
+            isAtBottom: ChatScrollPolicy.isAtBottom(distanceFromBottom: metrics.distanceFromBottom),
+            isUserScrolling: metrics.isUserInteracting,
+            movedAwayFromBottom: metrics.movedAwayFromBottom,
+            wasNearBottom: wasNearBottom
+        ))
+    }
+
+    private var isStreaming: Bool { [.running, .needsAttention, .stopping].contains(model.turn) }
+
+    private var showsScrollToBottomButton: Bool {
+        ChatScrollPolicy.showsScrollToBottomButton(
+            isNearBottom: isNearBottom, isStreaming: isStreaming, isFollowing: followsLatest
+        )
+    }
+
     private func followLatest(_ proxy: ScrollViewProxy) {
         guard followsLatest else { return }
         // The stable trailing anchor follows growing output without animating every token.
@@ -206,7 +237,6 @@ import SwiftUI
             model: model,
             onStop: { stopAction = model.prepareStop() },
             onReconnect: { recoveryID = UUID() },
-            onResolveHeldMessage: { confirmingDiscard = true },
             onShowRequest: { showRequestID = UUID() }
         )
     }

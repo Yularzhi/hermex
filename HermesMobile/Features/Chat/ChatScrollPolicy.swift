@@ -157,6 +157,11 @@ enum ChatScrollPolicy {
         return latch
     }
 
+    /// Proximity, not the follow latch, hides the arrow at the bottom.
+    static func showsScrollToBottomButton(isNearBottom: Bool, isStreaming: Bool, isFollowing: Bool) -> Bool {
+        !isNearBottom && (!isStreaming || !isFollowing)
+    }
+
     static func isAtBottom(distanceFromBottom: CGFloat) -> Bool {
         distanceFromBottom <= followReArmThreshold
     }

@@ -12,6 +12,7 @@ import Foundation
     private var imageUploads: [UUID: Task<String, Error>] = [:]
     private var artifactTasks: [UUID: Task<Data, Error>] = [:]
     private var nextID = 0
+    private var settingCalls = Set<Int>()
     private var pending: [Int: CheckedContinuation<BotJSON, Error>] = [:]
     private var deadlines: [Int: Task<Void, Never>] = [:]
     private(set) var replayEpoch: String?
@@ -132,11 +133,28 @@ import Foundation
     func call(_ method: String, _ params: [String: BotJSON], validateDispatch: (() throws -> Void)? = nil) async throws -> BotJSON {
         guard ["profiles.list", "profiles.get_asset", "profiles.configure", "session.list", "session.resume", "session.events.since",
                "file.attach", "prompt.submit", "session.steer", "session.redirect", "session.interrupt", "approval.respond", "clarify.respond",
-               "sudo.respond", "secret.respond", "mcp.setup.respond"].contains(method)
+               "sudo.respond", "secret.respond", "mcp.setup.respond",
+               "model.options", "config.set", "session.cwd.set", "session.control.read", "session.control"].contains(method)
         else { throw BotFailure.unsupported }
         guard let socket, !Task.isCancelled else { throw BotFailure.stale }
         nextID += 1
         let id = nextID
+        if ["config.set", "session.cwd.set", "session.control", "model.options", "session.control.read"].contains(method) {
+            settingCalls.insert(id)
+        }
+        defer { settingCalls.remove(id) }
+        // The host still has a missing-runtime fallback for effort/fast. The
+        // maintainer accepts that limitation; never send global or display writes.
+        if method == "config.set" {
+            guard params["scope"]?.text == "session", params["session_id"]?.text?.isEmpty == false,
+                  let value = params["value"]?.text else { throw BotFailure.unsupported }
+            switch params["key"]?.text {
+            case "model": guard value.hasSuffix(" --session") else { throw BotFailure.unsupported }
+            case "reasoning": guard BotModelCatalog.effortLevels.contains(value) else { throw BotFailure.unsupported }
+            case "fast": guard ["fast", "normal"].contains(value) else { throw BotFailure.unsupported }
+            default: throw BotFailure.unsupported
+            }
+        }
         let owner = generation
         let frame = BotJSON.object([
             "jsonrpc": .string("2.0"), "id": .number(Double(id)),
@@ -191,7 +209,11 @@ import Foundation
         if frame["method"].text == "event" { onEvent?(frame["params"]); return }
         guard let id = frame["id"].integer, let continuation = pending.removeValue(forKey: id) else { return }
         deadlines.removeValue(forKey: id)?.cancel()
-        if let code = frame["error"]["code"].integer { continuation.resume(throwing: BotFailure.rejected(code)) }
+        if let code = frame["error"]["code"].integer {
+            if settingCalls.contains(id) {
+                continuation.resume(throwing: BotSettingFailure.rejected(code, frame["error"]["message"].text ?? BotFailure.rejected(code).localizedDescription))
+            } else { continuation.resume(throwing: BotFailure.rejected(code)) }
+        }
         else if frame["result"] != .null { continuation.resume(returning: frame["result"]) }
         else { continuation.resume(throwing: BotFailure.unsupported) }
     }

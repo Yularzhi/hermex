@@ -16,14 +16,80 @@ import XCTest
         )
     }
 
-    func testHeldDraftComposerRemainsEditableAndKeyboardSendOffersRecovery() async throws {
+    func testBotComposerUsesSessionsModelAndEffortRow() async throws {
+        let wire = BotFixtureWire()
+        wire.settingsCall = { method, _ in
+            if method == "model.options" {
+                return .object(["model": .string("Model Alpha"), "provider": .string("anthropic"),
+                    "providers": .array([.object(["slug": .string("anthropic"), "models": .array([.string("Model Alpha")])])])])
+            }
+            return .object(["control": .object([:])])
+        }
+        let model = make(wire)
+        await model.recover()
+        model.chatControls.snapshot(.object(["cwd": .string("/workspace"), "reasoning_effort": .string("high"),
+            "fast": .bool(false), "usage": .object(["context_used": .number(24000), "context_max": .number(100000)])]), idle: true)
+        let window = try show(VStack {
+            Spacer()
+            BotChatComposerView(model: model, onStop: {}, onReconnect: {}, onShowRequest: {})
+        })
+        window.overrideUserInterfaceStyle = .dark
+        defer { close(window); model.suspend() }
+        await renderFrames()
+        let editor = try XCTUnwrap(descendants(window).compactMap { $0 as? ComposerChipTextView }.first)
+        XCTAssertTrue(editor.becomeFirstResponder())
+        await renderFrames(30)
+        let text = try screenshot(window, name: "479-sessions-model-row")
+        XCTAssertTrue(text.contains("Model Alpha"), text)
+        XCTAssertTrue(text.localizedCaseInsensitiveContains("high"), text)
+    }
+
+    func testLatestArrowLayoutAboveAndAtTheBottom() async throws {
+        let wire = BotFixtureWire()
+        wire.history = (0..<30).map { index in
+            .object(["role": .string(index.isMultiple(of: 2) ? "user" : "assistant"),
+                     "text": .string("Message \(index): A saved conversation with enough history to scroll.")])
+        }
+        let model = make(wire)
+        await model.recover()
+        let window = try show(BotChatView(model: model)
+            .environment(\.scenePhase, .inactive))
+        window.overrideUserInterfaceStyle = .dark
+        defer { close(window); model.suspend() }
+        await renderFrames(30)
+        XCTAssertNotNil(descendants(window).compactMap { $0 as? ChatScrollObserver.ObserverView }.first)
+        let scroll = try XCTUnwrap(descendants(window).compactMap { $0 as? UIScrollView }.first {
+            $0.bounds.width > 300 && $0.contentSize.height > $0.bounds.height
+        })
+        scroll.setContentOffset(CGPoint(x: 0, y: -scroll.adjustedContentInset.top), animated: false)
+        await renderFrames(30)
+        XCTAssertLessThan(scroll.contentOffset.y, 1)
+        let above = try screenshot(window, name: "479-latest-arrow-above-bottom")
+        XCTAssertFalse(above.contains("Latest"), above)
+        scroll.setContentOffset(CGPoint(x: 0, y: scroll.contentSize.height - scroll.bounds.height + scroll.adjustedContentInset.bottom), animated: false)
+        await renderFrames(30)
+        let distance = scroll.contentSize.height - scroll.bounds.height + scroll.adjustedContentInset.bottom - scroll.contentOffset.y
+        XCTAssertLessThanOrEqual(distance, ChatScrollPolicy.followReArmThreshold)
+        _ = try screenshot(window, name: "479-latest-arrow-hidden-at-bottom")
+    }
+
+    func testMissingUsageUsesTheSessionsRing() async throws {
+        let settings = BotChatControls()
+        let window = try show(BotComposerSettings(settings: settings, preparePresentation: {}, dismissPresentation: {}))
+        defer { close(window) }
+        await renderFrames()
+        let text = try screenshot(window, name: "479-missing-context-ring")
+        XCTAssertFalse(text.contains("Usage"), text)
+    }
+
+    func testRecoveredDraftIsEditableWithoutHeldMessageWarningOrConfirmation() async throws {
         let wire = BotFixtureWire(); let model = make(wire)
         await model.recover(); model.editDraft("Test")
         wire.submitFailure = .transport
         await model.send(); await model.recover()
-        XCTAssertTrue(model.uncertainSend)
+        XCTAssertFalse(model.uncertainSend)
         let window = try show(NavigationStack {
-            BotChatComposerView(model: model, onStop: {}, onReconnect: {}, onResolveHeldMessage: {}, onShowRequest: {})
+            BotChatComposerView(model: model, onStop: {}, onReconnect: {}, onShowRequest: {})
         })
         defer { model.suspend(); close(window) }
         await renderFrames()
@@ -34,11 +100,16 @@ import XCTest
         editor.insertText(" edited")
         XCTAssertTrue(model.draft.contains("edited"))
         XCTAssertTrue(editor.isKeyboardSendEnabled)
-        editor.onKeyboardSend()
-        await renderFrames()
+        let restored = try screenshot(window, name: "479-silently-restored-draft")
+        XCTAssertFalse(restored.contains("not confirmed"), restored)
+        XCTAssertFalse(restored.contains("Resolve held"), restored)
         XCTAssertEqual(wire.calls.filter { $0.0 == "prompt.submit" }.count, 1)
-        let confirmation = try screenshot(window, name: "held-draft-send-confirmation")
-        XCTAssertTrue(confirmation.contains("Send this draft?"), confirmation)
+        wire.submitFailure = nil
+        let sent = expectation(description: "Explicit keyboard send reaches host")
+        wire.beforeSubmit = { sent.fulfill() }
+        editor.onKeyboardSend()
+        await fulfillment(of: [sent], timeout: 3)
+        XCTAssertEqual(wire.calls.filter { $0.0 == "prompt.submit" }.count, 2)
     }
 
     func testAttachmentComposerUsesSessionsCardAndPillPresentation() async throws {
@@ -51,7 +122,7 @@ import XCTest
         await model.attachments.stage(data: Data("%PDF-fixture".utf8), filename: "Report.pdf")
         let window = try show(VStack {
             Spacer()
-            BotChatComposerView(model: model, onStop: {}, onReconnect: {}, onResolveHeldMessage: {}, onShowRequest: {})
+            BotChatComposerView(model: model, onStop: {}, onReconnect: {}, onShowRequest: {})
         })
         window.overrideUserInterfaceStyle = .dark
         defer { model.suspend(); close(window) }
@@ -63,7 +134,7 @@ import XCTest
         XCTAssertTrue(expanded.contains("Report.pdf"), expanded)
         XCTAssertFalse(expanded.contains("Photos"), expanded)
         XCTAssertFalse(expanded.contains("Files"), expanded)
-        XCTAssertGreaterThanOrEqual(descendants(window).compactMap { $0 as? UIButton }.filter { $0.menu != nil }.count, 2)
+        XCTAssertGreaterThanOrEqual(descendants(window).compactMap { $0 as? UIButton }.filter { $0.menu != nil }.count, 1)
         editor.resignFirstResponder()
         await renderFrames()
         _ = try screenshot(window, name: "478-composer-attachments-collapsed")
@@ -80,7 +151,7 @@ import XCTest
         }
         await model.attachments.stage(data: photo, filename: "photo.jpg")
         let window = try show(NavigationStack {
-            BotChatComposerView(model: model, onStop: {}, onReconnect: {}, onResolveHeldMessage: {}, onShowRequest: {})
+            BotChatComposerView(model: model, onStop: {}, onReconnect: {}, onShowRequest: {})
         })
         var finishUpload: CheckedContinuation<String, Error>?
         let uploadStarted = expectation(description: "upload started")
@@ -115,7 +186,7 @@ import XCTest
     func testBusyComposerShowsSteerAndRequiresExplicitSendAfterIdle() async throws {
         let wire = BotFixtureWire(); wire.running = true
         let model = make(wire); await model.recover(); model.editDraft("Focus on reconnect")
-        let window = try show(BotChatComposerView(model: model, onStop: {}, onReconnect: {}, onResolveHeldMessage: {}, onShowRequest: {}))
+        let window = try show(BotChatComposerView(model: model, onStop: {}, onReconnect: {}, onShowRequest: {}))
         defer { model.suspend(); close(window) }
         await renderFrames()
         let editor = try XCTUnwrap(descendants(window).compactMap { $0 as? ComposerChipTextView }.first)
@@ -133,22 +204,22 @@ import XCTest
         XCTAssertFalse(wire.calls.contains { ["prompt.submit", "session.steer", "session.redirect"].contains($0.0) })
     }
 
-    func testReadyHasNoStatusAndDisconnectShowsRecoveryAboveComposer() async throws {
+    func testTransientDisconnectRemainsQuietAboveComposer() async throws {
         let wire = BotFixtureWire()
         let model = make(wire)
         await model.recover()
-        let window = try show(BotChatComposerView(model: model, onStop: {}, onReconnect: {}, onResolveHeldMessage: {}, onShowRequest: {}))
+        let window = try show(BotChatComposerView(model: model, onStop: {}, onReconnect: {}, onShowRequest: {}))
         defer { model.suspend(); close(window) }
         await renderFrames()
         let ready = try screenshot(window, name: "ready-no-status")
         XCTAssertFalse(ready.contains("Connected"))
         XCTAssertFalse(ready.contains("Ready"))
-        XCTAssertTrue(ready.contains("Message bot"))
+        XCTAssertTrue(ready.contains("Ask anything"))
         wire.onDisconnect?(BotFailure.transport)
         await renderFrames()
         let disconnected = try screenshot(window, name: "disconnected-status")
-        XCTAssertTrue(disconnected.contains("Disconnected"))
-        XCTAssertTrue(disconnected.contains("Reconnect"))
+        XCTAssertFalse(disconnected.contains("Disconnected"), disconnected)
+        XCTAssertFalse(disconnected.contains("Reconnect"), disconnected)
         XCTAssertFalse(model.maySend)
     }
 
@@ -158,13 +229,13 @@ import XCTest
         XCTAssertFalse(model.mayEditDraft)
         await model.recover()
         model.editDraft("Persistent text")
-        let window = try show(BotChatComposerView(model: model, onStop: {}, onReconnect: {}, onResolveHeldMessage: {}, onShowRequest: {}))
+        let window = try show(BotChatComposerView(model: model, onStop: {}, onReconnect: {}, onShowRequest: {}))
         defer { model.suspend(); close(window) }
         await renderFrames()
         let editor = try XCTUnwrap(descendants(window).compactMap { $0 as? ComposerChipTextView }.first)
         XCTAssertTrue(editor.acceptsAttachments)
         XCTAssertTrue(editor.isKeyboardSendEnabled)
-        XCTAssertEqual(editor.accessibilityLabel, "Message bot")
+        XCTAssertEqual(editor.accessibilityLabel, "Ask anything...")
         XCTAssertTrue(editor.becomeFirstResponder())
         await renderFrames()
         XCTAssertTrue(editor.isFirstResponder)
@@ -193,7 +264,7 @@ import XCTest
         await model.recover()
         XCTAssertTrue(model.uncertainStop)
         XCTAssertEqual(model.turn, .needsAttention)
-        let window = try show(BotChatComposerView(model: model, onStop: {}, onReconnect: {}, onResolveHeldMessage: {}, onShowRequest: {}))
+        let window = try show(BotChatComposerView(model: model, onStop: {}, onReconnect: {}, onShowRequest: {}))
         defer { model.suspend(); close(window) }
         await renderFrames()
         let status = try screenshot(window, name: "attention-over-uncertain-stop")
