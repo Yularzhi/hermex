@@ -88,6 +88,37 @@ final class BotHistoryCacheTests: XCTestCase {
         XCTAssertFalse(try String(contentsOf: file, encoding: .utf8).contains("Fresh Newport"))
     }
 
+    func testExpiryWriteFailureKeepsFreshResultsAndRetriesCleanup() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let file = directory.appendingPathComponent("history.json")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
+            try? FileManager.default.removeItem(at: directory)
+        }
+        let scope = BotHistoryCache.Scope(server: server, connectionID: connection)
+        let now = Date()
+        let rows = [
+            BotHistoryCache.Snapshot(id: UUID(), scope: scope, profileID: "old", profileName: nil,
+                root: "root", tip: "tip", savedAt: now.addingTimeInterval(-BotHistoryCache.lifetime - 1),
+                messages: [.init(id: "old", role: "assistant", text: "Expired Newport")]),
+            BotHistoryCache.Snapshot(id: UUID(), scope: scope, profileID: "fresh", profileName: nil,
+                root: "root", tip: "tip", savedAt: now,
+                messages: [.init(id: "fresh", role: "assistant", text: "Fresh Newport")])
+        ]
+        try JSONEncoder().encode(rows).write(to: file)
+        try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: directory.path)
+        let cache = BotHistoryCache(directory: directory)
+        let hits = try await cache.search("Newport", scope: scope, profileIDs: nil)
+        XCTAssertEqual(hits.map(\.message.id), ["fresh"])
+        XCTAssertTrue(try String(contentsOf: file, encoding: .utf8).contains("Expired Newport"),
+                      "The fixture must prevent the cleanup write")
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
+        let retried = try await cache.search("Newport", scope: scope, profileIDs: nil)
+        XCTAssertEqual(retried.map(\.message.id), ["fresh"])
+        XCTAssertFalse(try String(contentsOf: file, encoding: .utf8).contains("Expired Newport"))
+    }
+
     func testClearIsServerScopedAndRejectsEarlierQueuedWrites() async throws {
         let cache = BotHistoryCache()
         let now = Date()

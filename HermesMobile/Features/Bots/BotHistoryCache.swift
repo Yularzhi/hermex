@@ -46,6 +46,7 @@ actor BotHistoryCache {
     static let lifetime: TimeInterval = 30 * 24 * 60 * 60
     private let directory: URL?
     private var loaded = false
+    private var needsPrunePersistence = false
     private var snapshots: [Snapshot] = []
     private var removed: Set<Scope> = []
     private var clearedAt: [String: Date] = [:]
@@ -88,7 +89,7 @@ actor BotHistoryCache {
         try load()
         let previousCount = snapshots.count
         snapshots.removeAll { now.timeIntervalSince($0.savedAt) >= Self.lifetime }
-        if snapshots.count != previousCount { try persist() }
+        persistPruning(previousCount: previousCount)
         var hits: [Hit] = []
         for snapshot in snapshots.reversed() where snapshot.scope == scope
             && (profileIDs?.contains(snapshot.profileID) ?? true) && now.timeIntervalSince(snapshot.savedAt) < Self.lifetime {
@@ -136,7 +137,7 @@ actor BotHistoryCache {
         snapshots = try JSONDecoder().decode([Snapshot].self, from: Data(contentsOf: file))
         let previousCount = snapshots.count
         prune(now: Date())
-        if snapshots.count != previousCount { try persist() }
+        persistPruning(previousCount: previousCount)
     }
 
     private func prune(now: Date) {
@@ -144,6 +145,19 @@ actor BotHistoryCache {
         // Use encoded bytes for the actual disk budget, including JSON escaping.
         while !snapshots.isEmpty && (snapshots.count > 100 || ((try? JSONEncoder().encode(snapshots).count) ?? Int.max) > Self.maximumBytes) {
             snapshots.removeFirst()
+        }
+    }
+
+    /// Expiry cleanup must not prevent reading fresh messages when storage is
+    /// temporarily unwritable. Keep it pending so the next search retries it.
+    private func persistPruning(previousCount: Int) {
+        needsPrunePersistence = needsPrunePersistence || snapshots.count != previousCount
+        guard needsPrunePersistence else { return }
+        do {
+            try persist()
+            needsPrunePersistence = false
+        } catch {
+            // Fresh in-memory results remain usable; retry on the next access.
         }
     }
 
