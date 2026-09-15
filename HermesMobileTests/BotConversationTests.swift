@@ -491,7 +491,14 @@ import Vision
             XCTAssertTrue(wire.calls.allSatisfy { !["prompt.submit", "session.interrupt"].contains($0.0) })
             XCTAssertFalse(model.uncertainSend)
             XCTAssertFalse(model.uncertainStop)
-            if !stopping { XCTAssertEqual(model.draft, "not dispatched") }
+            if !stopping {
+                XCTAssertEqual(model.draft, "not dispatched")
+                XCTAssertEqual(model.connectionState, .disconnected)
+                XCTAssertEqual(model.errorMessage, BotFailure.stale.localizedDescription)
+                await model.recover()
+                XCTAssertTrue(model.maySend)
+                XCTAssertEqual(model.draft, "not dispatched")
+            }
             model.suspend()
         }
     }

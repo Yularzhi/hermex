@@ -463,10 +463,6 @@ import Observation
                     errorMessage = String(localized: "The work changed before this message could be sent. Choose an action again.")
                 }
                 refreshAfterPrompt()
-            } else if !promptDispatched {
-                errorMessage = error is CancellationError || error as? BotFailure == .stale
-                    ? String(localized: "Upload cancelled. Your message and attachments are still here.")
-                    : error.localizedDescription
             } else { disconnected(error) }
         }
     }
