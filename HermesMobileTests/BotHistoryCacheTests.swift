@@ -66,6 +66,28 @@ final class BotHistoryCacheTests: XCTestCase {
         XCTAssertFalse(disk.contains("runtime"))
     }
 
+    func testExpiredHistoryIsPrunedFromDiskOnLoadAndLaterSearch() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let scope = BotHistoryCache.Scope(server: server, connectionID: connection)
+        let now = Date()
+        let cache = BotHistoryCache(directory: directory)
+        try await cache.replace(scope: scope, profileID: "old", root: "root", tip: "tip",
+                                messages: [message("old", "Expired Newport")],
+                                receivedAt: now.addingTimeInterval(-BotHistoryCache.lifetime - 1))
+        let restored = BotHistoryCache(directory: directory)
+        let expired = try await restored.search("Newport", scope: scope, profileIDs: nil)
+        XCTAssertTrue(expired.isEmpty)
+        let file = directory.appendingPathComponent("history.json")
+        XCTAssertFalse(try String(contentsOf: file, encoding: .utf8).contains("Expired Newport"))
+        try await restored.replace(scope: scope, profileID: "new", root: "root", tip: "tip",
+                                   messages: [message("new", "Fresh Newport")], receivedAt: now)
+        let later = try await restored.search("Newport", scope: scope, profileIDs: nil,
+                                             now: now.addingTimeInterval(BotHistoryCache.lifetime + 1))
+        XCTAssertTrue(later.isEmpty)
+        XCTAssertFalse(try String(contentsOf: file, encoding: .utf8).contains("Fresh Newport"))
+    }
+
     func testClearIsServerScopedAndRejectsEarlierQueuedWrites() async throws {
         let cache = BotHistoryCache()
         let now = Date()

@@ -68,7 +68,7 @@ import SwiftUI
                         }
                         .buttonStyle(.plain)
                     }
-                    if matches.isEmpty {
+                    if matches.isEmpty && scope == .bots {
                         ContentUnavailableView("No bots found", systemImage: "magnifyingglass")
                     }
                 }

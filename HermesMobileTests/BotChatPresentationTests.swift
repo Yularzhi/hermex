@@ -31,6 +31,26 @@ import XCTest
         XCTAssertEqual(wire.calls.map { $0.0 }, ["profiles.list"])
     }
 
+    func testMessageQueryDoesNotShowNoBotsFoundInAllScope() async throws {
+        let server = URL(string: "https://search.example")!
+        let connection = BotConnection(id: UUID(), name: "Fixture", address: server, username: "fixture", password: "fixture")
+        let store = BotConnectionStore(keychain: InMemoryKeychainStore())
+        try store.save(connection, server: server)
+        let wire = BotInboxFixtureWire(roster: [
+            .object(["name": .string("inbox"), "display_name": .string("Inbox")])
+        ])
+        let inbox = BotInbox(server: server, store: store, makeWire: { _ in wire })
+        await inbox.open()
+        let cache = BotHistoryCache()
+        let window = try show(BotSearchView(inbox: inbox, cache: cache, query: "Newport") { _ in }
+            .environment(\.scenePhase, .active))
+        defer { close(window); inbox.close() }
+        await renderFrames(8)
+        let text = try screenshot(window, name: "481-message-search-empty-state")
+        XCTAssertTrue(text.contains("Newport"), text)
+        XCTAssertFalse(text.localizedCaseInsensitiveContains("No bots found"), text)
+    }
+
     func testCachedMessageReaderShowsTheSelectedSavedMessage() async throws {
         let server = URL(string: "https://search.example")!
         let scope = BotHistoryCache.Scope(server: server, connectionID: UUID())

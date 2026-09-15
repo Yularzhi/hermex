@@ -86,6 +86,9 @@ actor BotHistoryCache {
         let query = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !query.isEmpty else { return [] }
         try load()
+        let previousCount = snapshots.count
+        snapshots.removeAll { now.timeIntervalSince($0.savedAt) >= Self.lifetime }
+        if snapshots.count != previousCount { try persist() }
         var hits: [Hit] = []
         for snapshot in snapshots.reversed() where snapshot.scope == scope
             && (profileIDs?.contains(snapshot.profileID) ?? true) && now.timeIntervalSince(snapshot.savedAt) < Self.lifetime {
@@ -131,7 +134,9 @@ actor BotHistoryCache {
         let size = try file.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
         guard size <= Self.maximumBytes * 2 else { return }
         snapshots = try JSONDecoder().decode([Snapshot].self, from: Data(contentsOf: file))
+        let previousCount = snapshots.count
         prune(now: Date())
+        if snapshots.count != previousCount { try persist() }
     }
 
     private func prune(now: Date) {
