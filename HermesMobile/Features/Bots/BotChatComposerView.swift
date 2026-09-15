@@ -16,6 +16,10 @@ struct BotChatComposerView: View {
     @AppStorage(HeaderLogoColor.storageKey) private var themeHex = HeaderLogoColor.defaultHex
     @AppStorage(PrimaryActionTintSettings.isEnabledKey) private var tintsPrimaryActions = false
     @ScaledMetric(relativeTo: .body) private var actionIconSize: CGFloat = 16
+    @ScaledMetric(relativeTo: .body) private var plusIconSize: CGFloat = 20
+    @State private var shouldRestoreFocusAfterPicker = false
+    @State private var picker: BotAttachmentPicker?
+    @State private var preview: PendingAttachment?
     @State private var isFocused = false
     @State private var selection = ComposerSelection()
     @State private var inputHeight: CGFloat = 22
@@ -23,12 +27,14 @@ struct BotChatComposerView: View {
     @State private var keyboardIsVisible = false
 
     @State private var mode = BotPromptMode.send
+    @State private var confirmingHeldSend = false
     @State private var redirectAction: BotConversation.PromptAction?
 
-    private var showsToolbar: Bool { isFocused || !model.draft.isEmpty || mode != .send }
+    private var isExpanded: Bool { isFocused || picker != nil || shouldRestoreFocusAfterPicker || preview != nil || model.submittingPrompt != nil }
+    private var showsToolbar: Bool { isExpanded || mode != .send }
     private var showsStop: Bool { model.mayStop || model.turn == .stopping }
     private var canSend: Bool {
-        model.maySubmit(mode) && !model.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        (model.maySubmit(mode) || model.mayConfirmHeldSubmission) && (!model.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !model.attachments.items.isEmpty)
     }
     private var appearance: ChatComposerActionAppearance {
         ChatComposerActionAppearance(
@@ -52,45 +58,27 @@ struct BotChatComposerView: View {
                         .padding(.horizontal, 16).padding(.bottom, 8)
                 }
 
-                HStack(alignment: .center, spacing: 4) {
-                    ComposerTextInputView(
-                        text: Binding(get: { model.draft }, set: { model.editDraft($0) }),
-                        selection: $selection, isFocused: $isFocused,
-                        inputHeight: $inputHeight, measuredHeight: $measuredHeight,
-                        isDisabled: !model.mayEditDraft, isCollapsed: !isFocused,
-                        isKeyboardSendEnabled: canSend, verticalPadding: 12,
-                        chipSkills: [], chipFilePaths: [], quotes: [],
-                        onKeyboardSend: send,
-                        onPasteFileProviders: { _ in }, onPasteFileURLs: { _ in },
-                        onPasteImageProviders: { _ in }, onPasteImages: { _ in },
-                        onTapChip: { _ in }, onTapQuote: { _ in }, onRemoveQuote: { _ in },
-                        placeholder: String(localized: "Message bot"), acceptsAttachments: false
-                    )
-                    if !showsToolbar {
-                        if showsStop { stopButton } else { actionButton }
-                    }
+                if let error = model.attachments.errorMessage {
+                    Text(error).font(AppFont.footnote()).foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 16).padding(.bottom, 6)
                 }
-                .padding(.trailing, isFocused ? 0 : ChatComposerMetrics.pillInset)
-                .padding(.vertical, isFocused ? 0 : ChatComposerMetrics.pillInset)
-                .padding(.top, isFocused ? 2 : 0)
-                .padding(.bottom, isFocused ? 4 : 0)
-                .modifier(ChatComposerSurfaceStyle(isExpanded: isFocused))
-                .padding(.horizontal, 16)
+                if model.attachments.isImporting {
+                    Text("Adding attachment…").font(AppFont.footnote()).foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 16)
+                }
+
+                composerSurface.padding(.horizontal, 16)
 
                 if showsToolbar {
-                    ViewThatFits(in: .horizontal) {
-                        HStack {
+                    HStack(alignment: .center, spacing: 8) {
+                        ComposerToolbarScroller {
+                            plusMenu
                             modeMenu
-                            Spacer(minLength: 8)
-                            promptButtons
                         }
-                        VStack(alignment: .leading, spacing: 4) {
-                            modeMenu
-                            HStack { Spacer(minLength: 0); promptButtons }
-                        }
+                        promptButtons
                     }
                     .padding(.horizontal, 16)
-                    // Sessions adds a 6 pt stack gap before its 8 pt toolbar inset.
                     .padding(.top, 14)
                     .background(
                         Color(.systemBackground)
@@ -103,13 +91,46 @@ struct BotChatComposerView: View {
             // Focus flips arrive from UIKit outside any withAnimation, so the
             // pill-to-card morph and the row's insertion animate from here,
             // exactly as the Sessions composer does.
-            .animation(ChatMotion.composerChrome(reduceMotion: reduceMotion), value: isFocused)
+            .animation(ChatMotion.composerChrome(reduceMotion: reduceMotion), value: isExpanded)
+        }
+        .modifier(BotAttachmentPickerPresentation(model: model, picker: $picker))
+        .sheet(item: $preview) { item in
+            BotArtifactPreview(reference: TranscriptMediaReference(rawReference: item.name)) {
+                try await model.attachments.data(for: item)
+            }
+        }
+        .task(id: picker) {
+            guard picker == nil, shouldRestoreFocusAfterPicker else { return }
+            // Match Sessions' short delay while the native picker dismisses.
+            do { try await Task.sleep(for: .milliseconds(80)) } catch { return }
+            guard picker == nil, shouldRestoreFocusAfterPicker else { return }
+            shouldRestoreFocusAfterPicker = false
+            if model.mayEditDraft { isFocused = true }
+        }
+        .onDisappear { shouldRestoreFocusAfterPicker = false }
+        .onChange(of: model.attachments.items.isEmpty) { _, empty in
+            if !empty, mode == .steer || mode == .redirect { mode = model.mayGuide ? .queue : .send }
         }
         .padding(.bottom, keyboardIsVisible ? 10 : 0)
         .onChange(of: model.mayGuide) { _, busy in
-            if busy && mode == .send { mode = .steer }
+            if busy && mode == .send { mode = model.attachments.items.isEmpty ? .steer : .queue }
         }
-        .onAppear { if model.mayGuide && mode == .send { mode = .steer } }
+        .onAppear { if model.mayGuide && mode == .send { mode = model.attachments.items.isEmpty ? .steer : .queue } }
+        .confirmationDialog("Send this draft?", isPresented: $confirmingHeldSend, titleVisibility: .visible) {
+            Button("Send draft") {
+                Task {
+                    await model.restoreUncertainSubmission()
+                    guard !model.uncertainSend else { return }
+                    let nextMode: BotPromptMode = model.maySend ? .send : .queue
+                    guard let action = model.preparePrompt(nextMode) else { return }
+                    mode = nextMode
+                    await model.submit(action)
+                }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("The previous send was not confirmed. Sending this draft could duplicate it if the bot already received it.")
+        }
         .confirmationDialog("Redirect this bot's current work?", isPresented: Binding(
             get: { redirectAction != nil }, set: { if !$0 { redirectAction = nil } }
         ), titleVisibility: .visible) {
@@ -128,6 +149,78 @@ struct BotChatComposerView: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillHideNotification)) { _ in
             keyboardIsVisible = false
+        }
+    }
+
+    /// Same pill/card structure as the Sessions composer. The editor keeps its
+    /// identity as the attachment strip and controls move around it.
+    private var composerSurface: some View {
+        VStack(spacing: 0) {
+            if isExpanded {
+                ComposerAttachmentStripView(attachments: model.attachments.items, onRemove: { id in
+                    Task { await model.attachments.remove(id) }
+                }, onPreview: { preview = $0 })
+                .disabled(!model.mayEditDraft || model.attachments.isImporting)
+            }
+            HStack(alignment: .center, spacing: 4) {
+                ComposerTextInputView(
+                    text: Binding(get: { model.draft }, set: { model.editDraft($0) }),
+                    selection: $selection, isFocused: $isFocused,
+                    inputHeight: $inputHeight, measuredHeight: $measuredHeight,
+                    isDisabled: !model.mayEditDraft, isCollapsed: !isExpanded,
+                    isKeyboardSendEnabled: canSend, verticalPadding: 12,
+                    chipSkills: [], chipFilePaths: [], quotes: [],
+                    onKeyboardSend: send,
+                    onPasteFileProviders: { BotAttachmentPaste.providers($0, model: model) },
+                    onPasteFileURLs: { BotAttachmentPaste.files($0, model: model) },
+                    onPasteImageProviders: { BotAttachmentPaste.providers($0, model: model) },
+                    onPasteImages: { BotAttachmentPaste.images($0, model: model) },
+                    onTapChip: { _ in }, onTapQuote: { _ in }, onRemoveQuote: { _ in },
+                    placeholder: String(localized: "Message bot"), acceptsAttachments: model.mayEditDraft
+                )
+                if !isExpanded {
+                    ComposerAttachmentPillPreview(attachments: model.attachments.items, onPreview: { preview = $0 })
+                    if !showsToolbar { if showsStop { stopButton } else { actionButton } }
+                }
+            }
+            .padding(.trailing, isExpanded ? 0 : ChatComposerMetrics.pillInset)
+            .padding(.vertical, isExpanded ? 0 : ChatComposerMetrics.pillInset)
+        }
+        .padding(.top, isExpanded ? 2 : 0)
+        .padding(.bottom, isExpanded ? 4 : 0)
+        .modifier(ChatComposerSurfaceStyle(isExpanded: isExpanded))
+    }
+
+    private var plusMenu: some View {
+        ChatUIKitMenuButton {
+            Image(systemName: "plus")
+                .font(.system(size: plusIconSize, weight: .medium))
+                .foregroundStyle(Color(.secondaryLabel))
+                .frame(width: ChatComposerMetrics.actionSize, height: ChatComposerMetrics.actionSize)
+                .adaptiveGlass(.regular, isInteractive: true, fallbackMaterial: .ultraThinMaterial,
+                               inheritsClipping: true, in: Circle())
+                .clipShape(Circle())
+        } menu: {
+            UIMenu(children: [UIMenu(title: String(localized: "Attach"), options: [.displayInline], children: [
+                attachmentAction(.files, title: String(localized: "Attach File"), image: "paperclip"),
+                attachmentAction(.photos, title: String(localized: "Photos"), image: "photo.on.rectangle"),
+                attachmentAction(.camera, title: String(localized: "Camera"), image: "camera")
+            ])])
+        }
+        .tint(Color(.secondaryLabel))
+        .disabled(!model.mayImportAttachments || model.attachments.isImporting)
+        .accessibilityLabel("Composer options")
+    }
+
+    private func attachmentAction(_ choice: BotAttachmentPicker, title: String, image: String) -> UIAction {
+        UIAction(title: title, image: UIImage(systemName: image),
+                 attributes: choice == .camera && !UIImagePickerController.isSourceTypeAvailable(.camera) ? .disabled : []) { _ in
+            Task { @MainActor in
+                guard model.mayImportAttachments else { return }
+                shouldRestoreFocusAfterPicker = isFocused
+                isFocused = false
+                picker = choice
+            }
         }
     }
 
@@ -175,16 +268,12 @@ struct BotChatComposerView: View {
 
     private var actionButton: some View {
         Button(action: send) {
-            HStack(spacing: 6) {
-                if showsToolbar { Text(mode.title).font(AppFont.subheadline()) }
-                Image(systemName: "arrow.up")
-                    .font(.system(size: actionIconSize, weight: .semibold))
-            }
-            .padding(.horizontal, showsToolbar ? 14 : 0)
-            .frame(minWidth: ChatComposerMetrics.actionSize, minHeight: ChatComposerMetrics.actionSize)
-            .background(appearance.background)
-            .foregroundStyle(appearance.foreground)
-            .clipShape(Capsule())
+            Image(systemName: "arrow.up")
+                .font(.system(size: actionIconSize, weight: .semibold))
+                .frame(width: ChatComposerMetrics.actionSize, height: ChatComposerMetrics.actionSize)
+                .background(appearance.background)
+                .foregroundStyle(appearance.foreground)
+                .clipShape(Circle())
         }
         .buttonStyle(.chatTactile(.icon))
         .disabled(!canSend)
@@ -194,6 +283,10 @@ struct BotChatComposerView: View {
     }
 
     private func send() {
+        if model.mayConfirmHeldSubmission {
+            confirmingHeldSend = true
+            return
+        }
         guard let action = model.preparePrompt(mode) else { return }
         if mode == .redirect { redirectAction = action }
         else { Task { await model.submit(action) } }
@@ -221,10 +314,15 @@ private struct BotChatStatusView: View {
                 }
                 if let error = model.errorMessage { Text(error) }
                 if let receipt = model.promptReceipt { Text(receipt) }
-                if model.submittingPrompt != nil {
+                if model.isUploadingAttachments {
+                    HStack {
+                        Text("Uploading…")
+                        Button("Cancel upload") { model.cancelAttachmentUpload() }
+                    }
+                } else if model.submittingPrompt != nil {
                     Text("Sending…")
                 } else if model.uncertainSend {
-                    Text("Message outcome unknown. Check the conversation in Desktop before sending again.")
+                    Text("The previous send was not confirmed. You can edit this draft and try sending again.")
                     if model.connectionState == .connected {
                         Button("Resolve held message…", action: onResolveHeldMessage)
                     }

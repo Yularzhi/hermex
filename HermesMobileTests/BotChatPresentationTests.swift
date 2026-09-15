@@ -12,8 +12,104 @@ import XCTest
             server: URL(string: "https://webui.example")!,
             connection: BotConnection(id: UUID(), name: "Fixture Mac", address: URL(string: "http://hermes.local:9120")!, username: "fixture", password: "fixture"),
             profile: BotProfile(.object(["name": .string("inbox-triage")]))!,
-            wire: wire, drafts: ChatDraftStore(persistence: BotMemoryDrafts())
+            wire: wire, drafts: ChatDraftStore(persistence: BotMemoryDrafts()), attachmentCopies: BotAttachmentCopies()
         )
+    }
+
+    func testHeldDraftComposerRemainsEditableAndKeyboardSendOffersRecovery() async throws {
+        let wire = BotFixtureWire(); let model = make(wire)
+        await model.recover(); model.editDraft("Test")
+        wire.submitFailure = .transport
+        await model.send(); await model.recover()
+        XCTAssertTrue(model.uncertainSend)
+        let window = try show(NavigationStack {
+            BotChatComposerView(model: model, onStop: {}, onReconnect: {}, onResolveHeldMessage: {}, onShowRequest: {})
+        })
+        defer { model.suspend(); close(window) }
+        await renderFrames()
+        let editor = try XCTUnwrap(descendants(window).compactMap { $0 as? ComposerChipTextView }.first)
+        XCTAssertTrue(editor.isEditable)
+        XCTAssertTrue(editor.becomeFirstResponder())
+        await renderFrames()
+        editor.insertText(" edited")
+        XCTAssertTrue(model.draft.contains("edited"))
+        XCTAssertTrue(editor.isKeyboardSendEnabled)
+        editor.onKeyboardSend()
+        await renderFrames()
+        XCTAssertEqual(wire.calls.filter { $0.0 == "prompt.submit" }.count, 1)
+        let confirmation = try screenshot(window, name: "held-draft-send-confirmation")
+        XCTAssertTrue(confirmation.contains("Send this draft?"), confirmation)
+    }
+
+    func testAttachmentComposerUsesSessionsCardAndPillPresentation() async throws {
+        let wire = BotFixtureWire(); let model = make(wire)
+        await model.recover()
+        let photo = UIGraphicsImageRenderer(size: CGSize(width: 160, height: 100)).jpegData(withCompressionQuality: 0.8) { ctx in
+            UIColor.systemPink.setFill(); ctx.fill(CGRect(x: 0, y: 0, width: 160, height: 100))
+        }
+        await model.attachments.stage(data: photo, filename: "photo.jpg")
+        await model.attachments.stage(data: Data("%PDF-fixture".utf8), filename: "Report.pdf")
+        let window = try show(VStack {
+            Spacer()
+            BotChatComposerView(model: model, onStop: {}, onReconnect: {}, onResolveHeldMessage: {}, onShowRequest: {})
+        })
+        window.overrideUserInterfaceStyle = .dark
+        defer { model.suspend(); close(window) }
+        await renderFrames()
+        let editor = try XCTUnwrap(descendants(window).compactMap { $0 as? ComposerChipTextView }.first)
+        XCTAssertTrue(editor.becomeFirstResponder())
+        await renderFrames()
+        let expanded = try screenshot(window, name: "478-composer-attachments-expanded")
+        XCTAssertTrue(expanded.contains("Report.pdf"), expanded)
+        XCTAssertFalse(expanded.contains("Photos"), expanded)
+        XCTAssertFalse(expanded.contains("Files"), expanded)
+        XCTAssertGreaterThanOrEqual(descendants(window).compactMap { $0 as? UIButton }.filter { $0.menu != nil }.count, 2)
+        editor.resignFirstResponder()
+        await renderFrames()
+        _ = try screenshot(window, name: "478-composer-attachments-collapsed")
+        XCTAssertTrue(descendants(window).contains { $0 === editor })
+        XCTAssertEqual(model.attachments.items.count, 2)
+    }
+
+    func testFocusedAttachmentSendKeepsRenderingWhileUploadIsPending() async throws {
+        let wire = BotFixtureWire()
+        let model = make(wire)
+        await model.recover()
+        let photo = UIGraphicsImageRenderer(size: CGSize(width: 32, height: 32)).jpegData(withCompressionQuality: 0.8) { ctx in
+            UIColor.red.setFill(); ctx.fill(CGRect(x: 0, y: 0, width: 32, height: 32))
+        }
+        await model.attachments.stage(data: photo, filename: "photo.jpg")
+        let window = try show(NavigationStack {
+            BotChatComposerView(model: model, onStop: {}, onReconnect: {}, onResolveHeldMessage: {}, onShowRequest: {})
+        })
+        var finishUpload: CheckedContinuation<String, Error>?
+        let uploadStarted = expectation(description: "upload started")
+        wire.imageUpload = { _, _, _ in
+            try await withCheckedThrowingContinuation { continuation in
+                finishUpload = continuation
+                uploadStarted.fulfill()
+            }
+        }
+        defer {
+            finishUpload?.resume(throwing: CancellationError())
+            model.suspend(); close(window)
+        }
+        await renderFrames()
+        let editor = try XCTUnwrap(descendants(window).compactMap { $0 as? ComposerChipTextView }.first)
+        XCTAssertTrue(editor.becomeFirstResponder())
+        await renderFrames()
+        let send = Task { await model.send() }
+        await fulfillment(of: [uploadStarted], timeout: 3)
+        // A display-link callback cannot fire when setEditable re-enters SwiftUI
+        // during updateUIView. This reaches the focused, hosted Send transition.
+        await renderFrames()
+        XCTAssertTrue(model.isUploadingAttachments)
+        XCTAssertFalse(editor.isEditable)
+        XCTAssertFalse(editor.isFirstResponder)
+        finishUpload?.resume(returning: "/images/photo.jpg"); finishUpload = nil
+        await send.value
+        await renderFrames()
+        XCTAssertTrue(model.attachments.items.isEmpty)
     }
 
     func testBusyComposerShowsSteerAndRequiresExplicitSendAfterIdle() async throws {
@@ -66,7 +162,7 @@ import XCTest
         defer { model.suspend(); close(window) }
         await renderFrames()
         let editor = try XCTUnwrap(descendants(window).compactMap { $0 as? ComposerChipTextView }.first)
-        XCTAssertFalse(editor.acceptsAttachments)
+        XCTAssertTrue(editor.acceptsAttachments)
         XCTAssertTrue(editor.isKeyboardSendEnabled)
         XCTAssertEqual(editor.accessibilityLabel, "Message bot")
         XCTAssertTrue(editor.becomeFirstResponder())
@@ -335,7 +431,19 @@ import XCTest
         let model = make(wire)
         let window = try show(NavigationStack { BotChatView(model: model) }.environment(\.scenePhase, .active))
         defer { model.suspend(); close(window) }
-        await model.recover()
+        // Let the view own its one recovery. Starting another here can race
+        // the view's .task and erase the live event after this test sends it.
+        let connected = expectation(description: "view recovered")
+        func observeConnection() {
+            if model.connectionState == .connected { connected.fulfill(); return }
+            withObservationTracking {
+                _ = model.connectionState
+            } onChange: {
+                Task { @MainActor in observeConnection() }
+            }
+        }
+        observeConnection()
+        await fulfillment(of: [connected], timeout: 3)
         wire.onEvent?(.object([
             "session_id": .string("runtime"), "seq": .number(1), "type": .string("tool.start"),
             "payload": .object(["tool_id": .string("t1"), "name": .string("write_file"), "args": .object(["path": .string("reply-delivery.md")])])

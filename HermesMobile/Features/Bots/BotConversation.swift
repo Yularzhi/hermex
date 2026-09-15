@@ -13,8 +13,11 @@ import Observation
     struct PromptAction: Equatable {
         let generation: Int; let revision: Int; let runtime: String
         let mode: BotPromptMode; let text: String
+        var attachmentIDs: [UUID] = []
     }
 
+    private(set) var isUploadingAttachments = false
+    private var attachmentUploadTask: Task<String, Error>?
     private(set) var submittingPrompt: BotPromptMode?
     private(set) var promptReceipt: String?
     private(set) var unavailablePromptModes: Set<BotPromptMode> = []
@@ -27,6 +30,7 @@ import Observation
     private(set) var messages: [ChatMessage] = []
     private(set) var liveMessages: [ChatMessage] = []
     private(set) var errorMessage: String?
+    let attachments: BotAttachmentDraft
     private(set) var draft = ""
     private(set) var uncertainSend = false
     private(set) var uncertainStop = false
@@ -67,12 +71,27 @@ import Observation
     private let drafts: ChatDraftStore
 
     init(server: URL, connection: BotConnection, profile: BotProfile,
-         wire: (any BotTransport)? = nil, drafts: ChatDraftStore? = nil) {
+         wire: (any BotTransport)? = nil, drafts: ChatDraftStore? = nil,
+         attachmentCopies: any ChatDraftAttachmentStoring = ChatDraftAttachmentStore.shared) {
         self.server = server; self.connection = connection; self.profile = profile
         self.wire = wire ?? BotClient(connection: connection)
         self.drafts = drafts ?? .shared
+        self.attachments = BotAttachmentDraft(key: .bot(server: server, connectionID: connection.id, profile: profile.id),
+                                              drafts: drafts ?? .shared, copies: attachmentCopies)
         self.wire.onEvent = { [weak self] event in self?.observe(event) }
         self.wire.onDisconnect = { [weak self] error in self?.disconnected(error) }
+    }
+
+    var artifactContext: BotArtifactContext? {
+        guard connectionState == .connected, let tip else { return nil }
+        return BotArtifactContext(connectionID: connection.id, profile: profile.id, sessionID: tip, generation: generation)
+    }
+
+    func artifactData(path: String, context: BotArtifactContext) async throws -> Data {
+        guard context == artifactContext else { throw BotFailure.stale }
+        let data = try await wire.artifactData(path: path, context: context)
+        guard context == artifactContext, !Task.isCancelled else { throw BotFailure.stale }
+        return data
     }
 
     var draftKey: ChatDraftKey { .bot(server: server, connectionID: connection.id, profile: profile.id) }
@@ -91,16 +110,25 @@ import Observation
     }
 
     func maySubmit(_ mode: BotPromptMode) -> Bool {
-        !unavailablePromptModes.contains(mode) && (mode == .send ? maySend : mayGuide)
+        !attachments.isImporting && (attachments.items.isEmpty || mode == .send || mode == .queue)
+            && !unavailablePromptModes.contains(mode) && (mode == .send ? maySend : mayGuide)
     }
 
     func preparePrompt(_ mode: BotPromptMode) -> PromptAction? {
         guard maySubmit(mode), let runtime,
-              !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
-        return PromptAction(generation: generation, revision: turnRevision, runtime: runtime, mode: mode, text: draft)
+              (!draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !attachments.items.isEmpty) else { return nil }
+        return PromptAction(generation: generation, revision: turnRevision, runtime: runtime, mode: mode, text: draft, attachmentIDs: attachments.items.map(\.id))
     }
 
-    var mayEditDraft: Bool { hydrated && !uncertainSend && !localOperation }
+    var mayImportAttachments: Bool { mayEditDraft && connectionState == .connected }
+
+    var mayEditDraft: Bool { hydrated && !localOperation }
+
+    /// An ambiguous earlier write requires confirmation, not a locked editor.
+    var mayConfirmHeldSubmission: Bool {
+        uncertainSend && mayEditDraft && connectionState == .connected
+            && !uncertainStop && !attachments.isImporting && answeringRequestID == nil
+    }
 
     /// The one request blocking this conversation. A clarify or approval wins over
     /// a stream request: it is the outer blocker, and the host resolves the inner
@@ -150,6 +178,8 @@ import Observation
                 try check(owner)
                 draft = saved?.text ?? ""
                 uncertainSend = saved?.botSubmissionUncertain ?? false
+                await attachments.restore(saved?.attachments ?? [])
+                try check(owner)
                 hydrated = true
             }
             try await wire.connect()
@@ -335,10 +365,10 @@ import Observation
     func submit(_ action: PromptAction) async {
         guard action == preparePrompt(action.mode) else { return }
         let owner = action.generation
-        localOperation = true; uncertainSend = true; submittingPrompt = action.mode
+        localOperation = true; submittingPrompt = action.mode
         promptReceipt = nil; promptReceiptPersistsWhileIdle = false; errorMessage = nil
-        defer { if generation == owner { submittingPrompt = nil } }
-        drafts.setBotSubmissionUncertain(true, for: draftKey)
+        defer { if generation == owner { submittingPrompt = nil; localOperation = false } }
+        // Persist local copies before upload; an upload cannot start agent work.
         do {
             try await drafts.flush()
             try check(owner)
@@ -349,12 +379,32 @@ import Observation
             errorMessage = String(localized: "Could not save the draft. Your message was not sent.")
             return
         }
+        var promptDispatched = false
         do {
-            let reply = try await request(action.mode.method, action.mode.params(runtime: action.runtime, text: action.text), owner: owner) { [weak self] in
+            let text: String
+            if action.attachmentIDs.isEmpty { text = action.text }
+            else {
+                isUploadingAttachments = true
+                let task = Task { try await self.attachmentPrompt(action, owner: owner) }
+                attachmentUploadTask = task
+                defer {
+                    if owner == generation { isUploadingAttachments = false; attachmentUploadTask = nil }
+                }
+                text = try await withTaskCancellationHandler { try await task.value } onCancel: { task.cancel() }
+            }
+            try check(owner)
+            // Only prompt admission can have an unknown outcome. Keep this
+            // durable before dispatch, but never hold a draft during upload.
+            drafts.setBotSubmissionUncertain(true, for: draftKey)
+            try await drafts.flush()
+            try check(owner)
+            uncertainSend = true
+            let reply = try await request(action.mode.method, action.mode.params(runtime: action.runtime, text: text), owner: owner) { [weak self] in
                 guard let self else { throw BotFailure.stale }
                 try self.check(owner)
                 guard self.connectionState == .connected, self.runtime == action.runtime,
                       self.turnRevision == action.revision else { throw BotFailure.stale }
+                promptDispatched = true
             }
             let outcome = action.mode.outcome(reply)
             if outcome == .rejected {
@@ -366,10 +416,14 @@ import Observation
             }
             guard let receipt = outcome.receipt else { throw BotFailure.unsupported }
             drafts.setDraft("", for: draftKey)
+            drafts.setAttachments([], for: draftKey)
             drafts.setBotSubmissionUncertain(false, for: draftKey)
             try await drafts.flush()
             try check(owner)
-            draft = ""; uncertainSend = false; localOperation = false
+            draft = ""; uncertainSend = false
+            await attachments.consumed()
+            try check(owner)
+            localOperation = false
             promptReceipt = receipt
             promptReceiptPersistsWhileIdle = outcome == .voiceStopped
             refreshAfterPrompt()
@@ -377,7 +431,7 @@ import Observation
             guard owner == generation, !Task.isCancelled else { return }
             // Only failures known to precede admission release the draft. A 5000
             // may follow a side effect; an unrecognized success shape is ambiguous.
-            let safe = error as? BotFailure == .stale || action.mode.definitelyRejected(error)
+            let safe = !promptDispatched || error as? BotFailure == .stale || action.mode.definitelyRejected(error)
             if safe {
                 do { try await releasePromptMarker(owner: owner) }
                 catch { guard owner == generation else { return }; disconnected(error); localOperation = false; return }
@@ -385,6 +439,7 @@ import Observation
             guard owner == generation else { return }
             if !safe {
                 // A failed durable clear must leave the original text held too.
+                drafts.setAttachments(attachments.items.map(ChatDraftAttachment.init(pending:)), for: draftKey)
                 drafts.setDraft(action.text, for: draftKey)
                 drafts.setBotSubmissionUncertain(true, for: draftKey)
                 try? await drafts.flush()
@@ -404,8 +459,49 @@ import Observation
                     errorMessage = String(localized: "The work changed before this message could be sent. Choose an action again.")
                 }
                 refreshAfterPrompt()
+            } else if !promptDispatched {
+                errorMessage = error is CancellationError || error as? BotFailure == .stale
+                    ? String(localized: "Upload cancelled. Your message and attachments are still here.")
+                    : error.localizedDescription
             } else { disconnected(error) }
         }
+    }
+
+    /// Every returned path is bound to this captured action; partial uploads never
+    /// enter another prompt. Uploaded files remain host-owned if Send is cancelled.
+    func cancelAttachmentUpload() { attachmentUploadTask?.cancel() }
+
+    private func attachmentPrompt(_ action: PromptAction, owner: Int) async throws -> String {
+        var text = action.text
+        guard !action.attachmentIDs.isEmpty else { return text }
+        guard attachments.items.count <= 8,
+              attachments.items.reduce(0, { $0 + ($1.size ?? BotAttachmentDraft.maximumFileBytes) }) <= BotAttachmentDraft.maximumTotalBytes
+        else { throw BotAttachmentFailure.limit }
+        guard let context = artifactContext else { throw BotFailure.stale }
+        for item in attachments.items {
+            try check(owner)
+            guard runtime == action.runtime, turnRevision == action.revision else { throw BotFailure.stale }
+            let data = try await attachments.data(for: item)
+            try check(owner)
+            let reference: String
+            if item.isImage {
+                let path = try await wire.uploadImage(data: data, filename: item.name, context: context)
+                reference = BotAttachmentUpload.imageReference(path: try BotAttachmentUpload.verifiedPath(path))
+            } else {
+                let params = await BotAttachmentUpload.fileParams(data: data, runtime: action.runtime, filename: item.name, mime: item.mime)
+                let reply = try await request("file.attach", params, owner: owner) { [weak self] in
+                    guard let self, self.runtime == action.runtime, self.turnRevision == action.revision else { throw BotFailure.stale }
+                }
+                guard reply["attached"].flag == true, let ref = reply["ref_text"].text, ref.hasPrefix("@file:"),
+                      !ref.contains("\n"), !ref.contains("\r") else { throw BotFailure.unsupported }
+                _ = try BotAttachmentUpload.verifiedPath(reply["path"].text)
+                reference = ref
+            }
+            try check(owner)
+            guard context == artifactContext else { throw BotFailure.stale }
+            text += "\n\n" + reference
+        }
+        return text
     }
 
     private func releasePromptMarker(owner: Int) async throws {
@@ -611,17 +707,37 @@ import Observation
         }
     }
 
+    /// Explicit recovery preserves the draft without retrying an ambiguous write.
+    func restoreUncertainSubmission() async {
+        guard uncertainSend, connectionState == .connected, !localOperation else { return }
+        let owner = generation
+        localOperation = true
+        defer { if owner == generation { localOperation = false } }
+        do {
+            try await releasePromptMarker(owner: owner)
+            errorMessage = nil
+            await recover()
+        } catch {
+            if owner == generation {
+                errorMessage = String(localized: "Could not save the draft. The held message is still unresolved.")
+            }
+        }
+    }
+
     /// Explicitly discard a held ambiguous prompt after the user checks Desktop.
     /// The old text is never restored to the sendable composer.
     func discardUncertainSubmission() async {
         guard uncertainSend, connectionState == .connected, !localOperation else { return }
         let owner = generation
         drafts.setDraft("", for: draftKey)
+        drafts.setAttachments([], for: draftKey)
         drafts.setBotSubmissionUncertain(false, for: draftKey)
         do {
             try await drafts.flush()
             try check(owner)
             draft = ""; uncertainSend = false
+            await attachments.consumed()
+            try check(owner)
             await recover()
         } catch {
             if owner == generation {
@@ -726,6 +842,8 @@ import Observation
     }
 
     func suspend() {
+        attachmentUploadTask?.cancel(); attachmentUploadTask = nil; isUploadingAttachments = false
+        attachments.cancelImport()
         generation += 1; turnRevision += 1
         refreshTask?.cancel(); refreshTask = nil
         wire.close()

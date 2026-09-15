@@ -145,11 +145,88 @@ clarification vocabulary, shared through `PendingRequestSurfaces.swift` and
 same response field and submit button as the Sessions clarification card. Like Sessions, "Always allow"
 writes a permanent host rule without a second confirmation.
 
+Returned artifacts use the existing transcript media parser with local Markdown
+file-link recognition enabled only for Bots. Assistant images, `MEDIA:` references,
+`file:` links and local document links open in native Quick Look; image thumbnails
+are downsampled off the main actor. Text stays synchronous while snapshots grow.
+Ordinary external web links retain their normal behavior. Remote image URLs and
+unknown media forms do not gain authenticated access to other hosts.
+
+`BotArtifactContext` captures connection UUID, Profile, durable compression-tip
+session ID and conversation generation. `BotClient` downloads through its existing
+cookie session using `GET /api/fs/download?path=…&profile=…&session_id=…`.
+Relative paths are resolved by the host's session cwd; no iOS filesystem base or
+webui transport is used. Known same-origin media/download links contribute only
+their path; embedded auth tokens and identity overrides are discarded. Redirects
+are rejected. Each response is capped at 25 MB, including chunked responses with
+no length header. Disconnect cancels downloads, stale completions are rejected,
+and dismissal removes the preview's temporary file. No persistent artifact cache
+is shared between conversations. Missing routes, denied files and unknown formats
+leave an explicit preview failure or the native viewer's unsupported-file state.
+
+The scoped download route and Profile/session parameters were verified in the
+running host's OpenAPI schema, with source verification of
+`hermes_cli/web_routers/files.py::_fs_download_path` and `fs_download`. The handler
+validates session ownership even for absolute paths. An authenticated read of a
+public README through the tunnel, bound to an existing session and Profile,
+returned the original bytes with attachment disposition. Native format playback
+still needs owner testing with returned artifacts.
+
+Attachment selection, paste and drop stage only local copies. The composer uses
+Sessions' circular + menu (File, Photos, Camera), glass card, in-card attachment
+strip, collapsed pill previews and circular Send control. Picker presentation
+keeps the card expanded and returns focus to the editor on dismissal.
+
+The shared UIKit editor applies editability changes after `updateUIView` returns.
+Disabling a focused UITextView synchronously inside that callback re-enters the
+SwiftUI responder graph and can freeze the screen at Send. A hosted-composer test
+keeps an upload pending while checking display-link frames and editor state.
+
+Copies and records use the Bot draft key (server + connection UUID
++ Profile); navigation/relaunch never uploads them. Imports allow eight files,
+25 MB each and 50 MB total. Images are converted off the main actor to JPEG,
+limited to 4096 pixels on the longest edge; PDFs, text, audio and common document
+formats retain their original bytes. Removal deletes the local copy after the
+updated record reaches disk.
+
+Send and Queue upload the selected files and put only acknowledged references in
+that prompt. Steer/Redirect remain text-only. Images use the authenticated
+`POST /api/chat/image-upload?profile=…` with `{filename, data_url}` and require
+`{ok: true, path}`. This stores the image without touching `attached_images`.
+The prompt carries the returned absolute path with the vision-tool instruction
+used by Hermes's `_build_image_ref_message`; analysis uses the host's configured
+`vision_analyze` tool. This deliberately avoids `image.attach_bytes` and its
+shared next-prompt queue. It does not request native inline vision from the
+conversation model.
+
+Documents use `file.attach` with `{session_id, name, data_url}` on the captured
+runtime and require `attached`, `path` and `ref_text`. The returned `@file:` token
+is included verbatim. Hermes may append an expansion warning for a file outside
+the session cwd; that warning does not reject the prompt. The path remains
+available to agent tools. Actual document interpretation depends on the host's
+tools and file format.
+
+These upload handlers were rechecked against installed Hermes Agent 0.21.2 source
+on 2026-09-14, together with prompt preprocessing and text-mode image routing.
+No live upload or prompt was executed. The compatibility pin is unchanged.
+Missing methods/routes fail visibly and preserve the draft; removing attachments
+leaves the existing text-only path available. Cancellation and partial failure
+never submit the partial set. Files already uploaded remain host-owned; there is
+no verified session-scoped delete API, and the client never deletes guessed paths.
+Cancel upload retains the local draft. A lost prompt acknowledgment holds text
+and copies until the user explicitly restores or discards the draft. Accepted
+sends clear the durable record before deleting local copies.
+
 Bot drafts extend `ChatDraftStore` with server + connection UUID + Profile context.
-Before sending, the client flushes an unresolved marker to disk. An acknowledged
+After uploads finish, immediately before prompt submission, the client flushes an
+unresolved marker to disk. Upload interruptions never mark a draft ambiguous. An acknowledged
 send consumes the draft; explicit admission failures preserve its text. An
 ambiguous outcome stays held across navigation and relaunch. The user can check
-Desktop and explicitly discard the held text; that action never resends it.
+the conversation and explicitly restore the draft or discard it. Restoring retains
+text and local attachments and enables Send; neither recovery action submits a prompt.
+The composer stays editable while an outcome is unknown. Send offers explicit
+confirmation, restores the draft, and dispatches only after recovery succeeds; it
+queues the confirmed draft if work is already running. No automatic retry occurs.
 Identical text in recovered history cannot reliably attribute a submission.
 
 The composer offers Send for idle work and a Sessions-style native menu for

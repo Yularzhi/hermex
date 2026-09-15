@@ -9,6 +9,8 @@ import Foundation
     private let socketFactory: ((URL, [String]) -> any BotSocket)?
     private var reader: Task<Void, Never>?
     private var generation = 0
+    private var imageUploads: [UUID: Task<String, Error>] = [:]
+    private var artifactTasks: [UUID: Task<Data, Error>] = [:]
     private var nextID = 0
     private var pending: [Int: CheckedContinuation<BotJSON, Error>] = [:]
     private var deadlines: [Int: Task<Void, Never>] = [:]
@@ -129,7 +131,7 @@ import Foundation
 
     func call(_ method: String, _ params: [String: BotJSON], validateDispatch: (() throws -> Void)? = nil) async throws -> BotJSON {
         guard ["profiles.list", "profiles.get_asset", "profiles.configure", "session.list", "session.resume", "session.events.since",
-               "prompt.submit", "session.steer", "session.redirect", "session.interrupt", "approval.respond", "clarify.respond",
+               "file.attach", "prompt.submit", "session.steer", "session.redirect", "session.interrupt", "approval.respond", "clarify.respond",
                "sudo.respond", "secret.respond", "mcp.setup.respond"].contains(method)
         else { throw BotFailure.unsupported }
         guard let socket, !Task.isCancelled else { throw BotFailure.stale }
@@ -140,7 +142,11 @@ import Foundation
             "jsonrpc": .string("2.0"), "id": .number(Double(id)),
             "method": .string(method), "params": .object(params)
         ])
-        let text = String(decoding: try JSONEncoder().encode(frame), as: UTF8.self)
+        let text: String
+        if method == "file.attach" {
+            text = try await Task.detached { String(decoding: try JSONEncoder().encode(frame), as: UTF8.self) }.value
+            guard owner == generation, !Task.isCancelled else { throw BotFailure.stale }
+        } else { text = String(decoding: try JSONEncoder().encode(frame), as: UTF8.self) }
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
                 pending[id] = continuation
@@ -171,7 +177,12 @@ import Foundation
         } onCancel: {
             Task { @MainActor [weak self] in
                 guard let self, self.generation == owner else { return }
-                self.close()
+                if method == "file.attach" {
+                    // This RPC only stores bytes. A late reply must not enter a
+                    // prompt, but cancelling it need not drop the conversation.
+                    self.deadlines.removeValue(forKey: id)?.cancel()
+                    self.pending.removeValue(forKey: id)?.resume(throwing: CancellationError())
+                } else { self.close() }
             }
         }
     }
@@ -185,8 +196,42 @@ import Foundation
         else { continuation.resume(throwing: BotFailure.unsupported) }
     }
 
+    func artifactData(path: String, context: BotArtifactContext) async throws -> Data {
+        guard context.connectionID == connection.id, socket != nil else { throw BotFailure.stale }
+        let owner = generation
+        let url = try BotEndpoint.artifactURL(base: connection.address, path: path, context: context)
+        let id = UUID()
+        let task = Task { try await BotEndpoint.downloadArtifact(session: session, url: url) }
+        artifactTasks[id] = task
+        defer { artifactTasks[id] = nil }
+        return try await withTaskCancellationHandler {
+            let data = try await task.value
+            guard owner == generation, !Task.isCancelled else { throw BotFailure.stale }
+            return data
+        } onCancel: { task.cancel() }
+    }
+
+    func uploadImage(data: Data, filename: String, context: BotArtifactContext) async throws -> String {
+        guard context.connectionID == connection.id, socket != nil else { throw BotFailure.stale }
+        let owner = generation
+        let id = UUID()
+        let task = Task { try await BotAttachmentUpload.image(session: session, base: connection.address,
+                                                            data: data, filename: filename, profile: context.profile) }
+        imageUploads[id] = task
+        defer { imageUploads[id] = nil }
+        return try await withTaskCancellationHandler {
+            let path = try await task.value
+            guard owner == generation, !Task.isCancelled else { throw BotFailure.stale }
+            return path
+        } onCancel: { task.cancel() }
+    }
+
     func close() {
         generation += 1
+        for task in imageUploads.values { task.cancel() }
+        imageUploads.removeAll()
+        for task in artifactTasks.values { task.cancel() }
+        artifactTasks.removeAll()
         reader?.cancel(); reader = nil
         socket?.cancel(); socket = nil
         for deadline in deadlines.values { deadline.cancel() }

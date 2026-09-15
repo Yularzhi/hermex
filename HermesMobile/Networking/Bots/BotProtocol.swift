@@ -57,6 +57,7 @@ enum BotFailure: Error, Equatable, LocalizedError {
 enum BotEndpoint: String {
     case status = "api/status", login = "auth/password-login", identity = "api/auth/me"
     case ticket = "api/auth/ws-ticket", socket = "api/ws"
+    case imageUpload = "api/chat/image-upload"
     func url(base: URL) -> URL { base.appendingPathComponent(rawValue) }
 }
 
@@ -66,10 +67,20 @@ enum BotEndpoint: String {
     var onDisconnect: ((Error) -> Void)? { get set }
     func connect() async throws
     func call(_ method: String, _ params: [String: BotJSON], validateDispatch: (() throws -> Void)?) async throws -> BotJSON
+    func uploadImage(data: Data, filename: String, context: BotArtifactContext) async throws -> String
+    func artifactData(path: String, context: BotArtifactContext) async throws -> Data
     func close()
 }
 
 extension BotTransport {
+    func uploadImage(data: Data, filename: String, context: BotArtifactContext) async throws -> String {
+        throw BotFailure.unsupported
+    }
+
+    func artifactData(path: String, context: BotArtifactContext) async throws -> Data {
+        throw BotArtifactFailure.unavailable
+    }
+
     func call(_ method: String, _ params: [String: BotJSON]) async throws -> BotJSON {
         try await call(method, params, validateDispatch: nil)
     }

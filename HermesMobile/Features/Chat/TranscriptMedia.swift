@@ -136,9 +136,12 @@ enum TranscriptMediaParser {
     /// Splits an assistant message into text and media. `workspaceRoot` only resolves the
     /// relative forms of `![alt](path)`; an absolute path or a `file:` URL needs no root,
     /// and the server's `/api/media` allow-list decides what is actually served.
+    /// Bots opt into local file links, preserving relative destinations for the
+    /// originating host to resolve instead of applying a webui workspace root.
     static func segments(
         in markdown: String,
-        workspaceRoot: String? = nil
+        workspaceRoot: String? = nil,
+        includesLocalFileLinks: Bool = false
     ) -> [TranscriptMediaSegment] {
         guard !markdown.isEmpty else { return [] }
 
@@ -162,7 +165,7 @@ enum TranscriptMediaParser {
                 isInFence = true
                 fenceCharacter = marker
             } else {
-                appendMediaSegments(in: line, to: &segments, workspaceRoot: workspaceRoot)
+                appendMediaSegments(in: line, to: &segments, workspaceRoot: workspaceRoot, includesLocalFileLinks: includesLocalFileLinks)
             }
 
             index = lineRange.upperBound
@@ -174,17 +177,18 @@ enum TranscriptMediaParser {
     private static func appendMediaSegments(
         in line: String,
         to segments: inout [TranscriptMediaSegment],
-        workspaceRoot: String?
+        workspaceRoot: String?,
+        includesLocalFileLinks: Bool
     ) {
         var cursor = line.startIndex
         var textStart = cursor
         let inlineCodeRanges = inlineCodeRanges(in: line)
 
         while cursor < line.endIndex {
-            if line[cursor...].hasPrefix(markdownImageMarker),
+            if (line[cursor...].hasPrefix(markdownImageMarker) || (includesLocalFileLinks && line[cursor] == "[")),
                !inlineCodeRanges.contains(where: { $0.contains(cursor) }),
                let image = markdownImage(in: line, from: cursor),
-               let reference = markdownImageReference(for: image, workspaceRoot: workspaceRoot) {
+               let reference = markdownImageReference(for: image, workspaceRoot: workspaceRoot, includesLocalFileLinks: includesLocalFileLinks) {
                 appendText(String(line[textStart..<cursor]), to: &segments)
                 segments.append(.media(reference))
 
@@ -238,19 +242,19 @@ enum TranscriptMediaParser {
         appendText(String(line[textStart..<line.endIndex]), to: &segments)
     }
 
-    /// One `![alt](destination "title")` occurrence, already split apart.
+    /// One inline Markdown image or file link, already split apart.
     private struct MarkdownImage {
         let alt: String
         let destination: String
         let end: String.Index
     }
 
-    /// Reads a Markdown image starting at `![`. Brackets and parentheses nest and can be
+    /// Reads an image starting at `![`, or an opted-in link at `[`. Delimiters nest and can be
     /// backslash-escaped, so `![Build (1)](/tmp/build(1)/shot.png)` reads as one image
     /// rather than being cut at the first `)`. A reference-style image, which has no
     /// destination at all, stays ordinary Markdown.
     private static func markdownImage(in line: String, from start: String.Index) -> MarkdownImage? {
-        guard let altOpen = line.index(start, offsetBy: 1, limitedBy: line.endIndex),
+        guard let altOpen = line.index(start, offsetBy: line[start] == "!" ? 1 : 0, limitedBy: line.endIndex),
               altOpen < line.endIndex,
               let altEnd = balancedEnd(in: line, after: altOpen, open: "[", close: "]")
         else { return nil }
@@ -357,8 +361,18 @@ enum TranscriptMediaParser {
     /// already does with them.
     private static func markdownImageReference(
         for image: MarkdownImage,
-        workspaceRoot: String?
+        workspaceRoot: String?,
+        includesLocalFileLinks: Bool
     ) -> TranscriptMediaReference? {
+        // Bot downloads resolve relative paths on the originating host. Do not
+        // turn a phone-local base URL into a server filesystem location.
+        if includesLocalFileLinks {
+            let destination = image.destination
+            guard !destination.isEmpty, !destination.hasPrefix("#"), !destination.hasPrefix("//"),
+                  URL(string: destination)?.scheme == nil || URL(string: destination)?.scheme == "file"
+            else { return nil }
+            return TranscriptMediaReference(rawReference: destination, altText: image.alt)
+        }
         guard let path = FileReference.absoluteMediaPath(
             image.destination,
             workspaceRoot: workspaceRoot

@@ -749,6 +749,17 @@ actor BotMemoryDrafts: ChatDraftPersisting {
     var beforeDispatch: ((String) -> Void)?
     var beforeSubmit: (() async -> Void)?
     var beforeResume: (() async -> Void)?
+    var attachFile: (([String: BotJSON]) async throws -> BotJSON)?
+    var imageUpload: ((Data, String, BotArtifactContext) async throws -> String)?
+    func uploadImage(data: Data, filename: String, context: BotArtifactContext) async throws -> String {
+        guard let imageUpload else { throw BotFailure.unsupported }
+        return try await imageUpload(data, filename, context)
+    }
+    var downloadArtifact: ((String, BotArtifactContext) async throws -> Data)?
+    func artifactData(path: String, context: BotArtifactContext) async throws -> Data {
+        guard let downloadArtifact else { throw BotArtifactFailure.unavailable }
+        return try await downloadArtifact(path, context)
+    }
     func connect() async throws {}
     func close() {}
     func call(_ method: String, _ params: [String: BotJSON], validateDispatch: (() throws -> Void)?) async throws -> BotJSON {
@@ -756,6 +767,9 @@ actor BotMemoryDrafts: ChatDraftPersisting {
         try validateDispatch?()
         calls.append((method, params))
         switch method {
+        case "file.attach":
+            guard let attachFile else { throw BotFailure.unsupported }
+            return try await attachFile(params)
         case "session.list":
             if let lookupFailure {
                 if lookupFailure == .missingChat { return .object(["sessions": .array([])]) }

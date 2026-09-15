@@ -55,6 +55,37 @@ import XCTest
         XCTAssertEqual(sockets.map { $0.sentTextFrames }, [1, 1])
     }
 
+    func testCancelFileUploadKeepsSocketAvailableWithoutResendingIt() async throws {
+        BotHTTPFixture.handler = { request in
+            switch request.url!.path {
+            case "/api/status": return (200, .object(["auth_required": .bool(true), "auth_providers": .array([.string("basic")])]))
+            case "/auth/password-login": return (200, .object([:]))
+            case "/api/auth/me": return (200, .object(["provider": .string("basic")]))
+            case "/api/auth/ws-ticket": return (200, .object(["ticket": .string("ticket")]))
+            default: return (404, .null)
+            }
+        }
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [BotHTTPFixture.self]
+        let socket = BotScriptedSocket()
+        let started = expectation(description: "file upload dispatched")
+        socket.withholdReply = { request in
+            guard request["method"].text == "file.attach" else { return false }
+            started.fulfill(); return true
+        }
+        let client = BotClient(connection: connection(), configuration: configuration) { _, _ in socket }
+        try await client.connect()
+        defer { client.close() }
+        let upload = Task { try await client.call("file.attach", ["session_id": .string("runtime"), "data_url": .string("aGVsbG8=")]) }
+        await fulfillment(of: [started], timeout: 2)
+        upload.cancel()
+        do { _ = try await upload.value; XCTFail("Cancelled upload succeeded") }
+        catch { XCTAssertTrue(error is CancellationError) }
+        _ = try await client.call("profiles.list", [:])
+        XCTAssertEqual(socket.sentRequests.filter { $0["method"].text == "file.attach" }.count, 1)
+        XCTAssertEqual(socket.sentRequests.last?["method"].text, "profiles.list")
+    }
+
     func testAllowlistAdmitsAvatarReadsButNoAssetWrites() async throws {
         BotHTTPFixture.handler = { request in
             switch request.url!.path {
@@ -167,6 +198,38 @@ import XCTest
         client.close()
     }
 
+    func testArtifactDownloadUsesBotHTTPBoundaryAndRejectsWrongOrClosedConnection() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [BotHTTPFixture.self]
+        let record = connection()
+        BotHTTPFixture.handler = { request in
+            switch request.url?.path {
+            case "/api/status": return (200, .object(["auth_required": .bool(true), "auth_providers": .array([.string("basic")])]))
+            case "/auth/password-login": return (200, .object([:]))
+            case "/api/auth/me": return (200, .object(["provider": .string("basic")]))
+            case "/api/auth/ws-ticket": return (200, .object(["ticket": .string("ticket")]))
+            default: XCTFail("Unexpected endpoint during connect"); return (404, .null)
+            }
+        }
+        let client = BotClient(connection: record, configuration: configuration) { _, _ in BotScriptedSocket() }
+        try await client.connect()
+        let context = BotArtifactContext(connectionID: record.id, profile: "same-profile", sessionID: "tip", generation: 1)
+        let value = BotJSON.object(["artifact": .string("fixture")])
+        BotHTTPFixture.handler = { request in
+            XCTAssertEqual(request.url?.host, record.address.host)
+            XCTAssertEqual(request.url?.path, "/api/fs/download")
+            return (200, value)
+        }
+        let data = try await client.artifactData(path: "report.json", context: context)
+        XCTAssertEqual(try JSONDecoder().decode(BotJSON.self, from: data), value)
+        let wrong = BotArtifactContext(connectionID: UUID(), profile: "same-profile", sessionID: "tip", generation: 1)
+        do { _ = try await client.artifactData(path: "report.json", context: wrong); XCTFail("Wrong connection") }
+        catch { XCTAssertEqual(error as? BotFailure, .stale) }
+        client.close()
+        do { _ = try await client.artifactData(path: "report.json", context: context); XCTFail("Closed connection") }
+        catch { XCTAssertEqual(error as? BotFailure, .stale) }
+    }
+
     private func connection() -> BotConnection {
         BotConnection(id: UUID(), name: "Fixture", address: URL(string: "https://hermes.example")!, username: "user", password: "fixture")
     }
@@ -195,6 +258,7 @@ private final class BotScriptedSocket: BotSocket, @unchecked Sendable {
     ]
     private var waiter: CheckedContinuation<URLSessionWebSocketTask.Message, Error>?
     private var closed = false
+    var withholdReply: ((BotJSON) -> Bool)?
     private(set) var sentTextFrames = 0
     private(set) var sentRequests: [BotJSON] = []
     func receive() async throws -> URLSessionWebSocketTask.Message {
@@ -209,6 +273,7 @@ private final class BotScriptedSocket: BotSocket, @unchecked Sendable {
         guard case .string(let text) = message else { XCTFail("JSON-RPC must use text frames"); throw BotFailure.unsupported }
         let request = try JSONDecoder().decode(BotJSON.self, from: Data(text.utf8))
         record(request)
+        if withholdReply?(request) == true { return }
         let response = BotJSON.object(["id": request["id"], "result": .object(["profiles": .array([])])])
         let frame = URLSessionWebSocketTask.Message.string(String(decoding: try JSONEncoder().encode(response), as: UTF8.self))
         enqueue(frame)

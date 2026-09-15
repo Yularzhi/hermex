@@ -34,12 +34,12 @@ import SwiftUI
                         }
                         ForEach(model.messages) { message in
                             settledActivity(anchoredTo: message.id)
-                            MessageBubbleView(message: message, textOnly: true)
+                            BotArtifactMessageView(message: message, model: model)
                         }
                         settledActivity(anchoredTo: nil)
                         // The live turn reads like a settled one: prompt, work, then reply.
                         if let prompt = model.liveMessages.first(where: { $0.role == "user" }) {
-                            MessageBubbleView(message: prompt, textOnly: true)
+                            BotArtifactMessageView(message: prompt, model: model)
                         }
                         if model.liveActivity.hasTurnWork {
                             BotActivityBlocksView(
@@ -48,7 +48,7 @@ import SwiftUI
                             )
                         }
                         if let reply = model.liveMessages.first(where: { $0.role == "assistant" }) {
-                            MessageBubbleView(message: reply, textOnly: true)
+                            BotArtifactMessageView(message: reply, model: model)
                         }
                         if let plan = model.plan {
                             BotPlanRowView(plan: plan).id("bot-plan")
@@ -137,12 +137,15 @@ import SwiftUI
         } message: {
             Text("This stops current work in this conversation, including work started in Desktop, clears queued prompts and denies pending approvals. It also stops host speech playback. A command already sent may reach later Desktop work.")
         }
-        .confirmationDialog("Discard the held message?", isPresented: $confirmingDiscard, titleVisibility: .visible) {
-            Button("I checked Desktop; discard held message", role: .destructive) {
+        .confirmationDialog("Resolve held message", isPresented: $confirmingDiscard, titleVisibility: .visible) {
+            Button("Restore draft") {
+                Task { await model.restoreUncertainSubmission() }
+            }
+            Button("Discard held message", role: .destructive) {
                 Task { await model.discardUncertainSubmission() }
             }
         } message: {
-            Text("First check whether Desktop received this message. Discarding removes the held text from Hermex. It does not stop or resend any work.")
+            Text("Restore keeps your text and attachments and enables sending again. Nothing is sent automatically. Check the conversation before sending to avoid a duplicate. Discard removes the local draft.")
         }
     }
 

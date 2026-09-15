@@ -249,8 +249,7 @@ private struct ComposerTextView: UIViewRepresentable {
             textView.pasteConfiguration = UIPasteConfiguration(acceptableTypeIdentifiers: pasteTypes)
         }
         context.coordinator.acceptsAttachments = acceptsAttachments
-        textView.isEditable = !isDisabled
-        textView.isSelectable = !isDisabled
+        context.coordinator.syncEditing(for: textView, isDisabled: isDisabled)
         textView.textColor = isDisabled ? .secondaryLabel : .label
         textView.isKeyboardSendEnabled = isKeyboardSendEnabled
         textView.onKeyboardSend = onKeyboardSend
@@ -287,6 +286,7 @@ private struct ComposerTextView: UIViewRepresentable {
         var onDropFileProviders: ([NSItemProvider]) -> Void = { _ in }
         var onDropImageProviders: ([NSItemProvider]) -> Void = { _ in }
         private var pendingFocusTarget: Bool?
+        private var pendingEditingTarget: Bool?
         /// Set while we push a bound value into the editor, so the delegate
         /// callbacks it provokes do not write the bindings back mid-update.
         private var isApplyingBoundValue = false
@@ -441,6 +441,26 @@ private struct ComposerTextView: UIViewRepresentable {
             isApplyingBoundValue = true
             body()
             isApplyingBoundValue = wasApplying
+        }
+
+        /// Disabling a focused UITextView can synchronously ask its SwiftUI
+        /// hosting view for the next responder. Do that after updateUIView has
+        /// returned, otherwise the responder lookup re-enters the active graph.
+        func syncEditing(for textView: UITextView, isDisabled: Bool) {
+            let editable = !isDisabled
+            guard textView.isEditable != editable || textView.isSelectable != editable else {
+                pendingEditingTarget = nil
+                return
+            }
+            guard pendingEditingTarget != editable else { return }
+            pendingEditingTarget = editable
+            DispatchQueue.main.async { [weak self, weak textView] in
+                guard let self, let textView, self.pendingEditingTarget == editable else { return }
+                self.pendingEditingTarget = nil
+                if !editable, textView.isFirstResponder { textView.resignFirstResponder() }
+                textView.isEditable = editable
+                textView.isSelectable = editable
+            }
         }
 
         func syncFocus(for textView: UITextView, shouldFocus: Bool, isDisabled: Bool) {
