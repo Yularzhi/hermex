@@ -307,6 +307,7 @@ final class AuthManager {
             await attemptBestEffortServerLogout(server: active)
         }
 
+        try? await BotHistoryCache.shared.removeServer(active, activeConnectionID: (try? BotConnectionStore(keychain: keychain).load(server: active))?.id)
         await ChatDraftStore.shared.discardBotDrafts(server: active)
         advanceAfterRemoving(activeServer: active)
     }
@@ -317,6 +318,7 @@ final class AuthManager {
     /// headers, and cookies — leaving the active server's auth untouched (#17).
     func removeServer(_ account: ServerAccount) async {
         guard let serverURL = URL(string: account.urlString) else { return }
+        try? await BotHistoryCache.shared.removeServer(serverURL, activeConnectionID: (try? BotConnectionStore(keychain: keychain).load(server: serverURL))?.id)
         await ChatDraftStore.shared.discardBotDrafts(server: serverURL)
         let isActive = state.server?.absoluteString == account.id
 

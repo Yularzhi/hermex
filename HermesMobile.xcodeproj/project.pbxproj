@@ -7,6 +7,10 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		C72A6DDA681F4CDABE7445DD /* BotHistoryCacheTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FE3A09625987439BABF6BC8C /* BotHistoryCacheTests.swift */; };
+		1F2596DE21154F7082ED4412 /* BotCachedHistoryView.swift in Sources */ = {isa = PBXBuildFile; fileRef = C6CF5956C3F148A081DD56F0 /* BotCachedHistoryView.swift */; };
+		F0907446778F4FBEBAEEC2B9 /* BotHistoryCache.swift in Sources */ = {isa = PBXBuildFile; fileRef = 41FCCA0BACC647998F9CC3D0 /* BotHistoryCache.swift */; };
+		6F1EF01AA79B446C989D7FC1 /* BotSearchView.swift in Sources */ = {isa = PBXBuildFile; fileRef = AF0AA6F787074B4A8DC903FF /* BotSearchView.swift */; };
 		D1F04357497D4FD381D726C8 /* BotChatControlsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6984D85D628F4E18ABAA2BA9 /* BotChatControlsTests.swift */; };
 		B5A4FFE7618543F4821205E6 /* BotChatControlViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3B8BB565E3C3410B8D11AED4 /* BotChatControlViews.swift */; };
 		88EF8F77C1434727A4C84D7D /* BotChatControls.swift in Sources */ = {isa = PBXBuildFile; fileRef = FFAECFA53DCE4DDF90FBEEE7 /* BotChatControls.swift */; };
@@ -508,6 +512,10 @@
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
+		FE3A09625987439BABF6BC8C /* BotHistoryCacheTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BotHistoryCacheTests.swift; sourceTree = "<group>"; };
+		C6CF5956C3F148A081DD56F0 /* BotCachedHistoryView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Bots/BotCachedHistoryView.swift; sourceTree = "<group>"; };
+		41FCCA0BACC647998F9CC3D0 /* BotHistoryCache.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Bots/BotHistoryCache.swift; sourceTree = "<group>"; };
+		AF0AA6F787074B4A8DC903FF /* BotSearchView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Bots/BotSearchView.swift; sourceTree = "<group>"; };
 		6984D85D628F4E18ABAA2BA9 /* BotChatControlsTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BotChatControlsTests.swift; sourceTree = "<group>"; };
 		3B8BB565E3C3410B8D11AED4 /* BotChatControlViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "Bots/BotChatControlViews.swift"; sourceTree = "<group>"; };
 		FFAECFA53DCE4DDF90FBEEE7 /* BotChatControls.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "Bots/BotChatControls.swift"; sourceTree = "<group>"; };
@@ -1069,6 +1077,7 @@
 				13BC5694F485465CA9648F24 /* BotArtifactTests.swift */,
 				EE6A7BC5738C4EF9AB0A965B /* BotDraftTests.swift */,
 				5DAB6E1003A74F1992A3C350 /* BotInboxTests.swift */,
+				FE3A09625987439BABF6BC8C /* BotHistoryCacheTests.swift */,
 				A496B07E0000000000000002 /* BotModeGateTests.swift */,
 				A496B07E0000000000000004 /* BotConnectionVersionTests.swift */,
 				A4730000000000000000A004 /* BotAvatarTests.swift */,
@@ -1296,6 +1305,9 @@
 			children = (
 				5B87CE542BE84D09A7D1E276 /* BotChatComposerView.swift */,
 				9FE221A56F264309AF71E18B /* BotsInboxView.swift */,
+				AF0AA6F787074B4A8DC903FF /* BotSearchView.swift */,
+				C6CF5956C3F148A081DD56F0 /* BotCachedHistoryView.swift */,
+				41FCCA0BACC647998F9CC3D0 /* BotHistoryCache.swift */,
 				9D93D8EC41FE4FBABD1746AD /* BotConversation.swift */,
 				3C75DCD3DB974E27A3CB405C /* BotPromptMode.swift */,
 				3B8BB565E3C3410B8D11AED4 /* BotChatControlViews.swift */,
@@ -1905,6 +1917,9 @@
 				729010E70E8041EA9414997D /* BotArtifactDownload.swift in Sources */,
 				D7750E758B8A432EA96770E2 /* BotAttachmentUpload.swift in Sources */,
 				7EF4120B486B4243AF54FCAF /* BotsInboxView.swift in Sources */,
+				6F1EF01AA79B446C989D7FC1 /* BotSearchView.swift in Sources */,
+				1F2596DE21154F7082ED4412 /* BotCachedHistoryView.swift in Sources */,
+				F0907446778F4FBEBAEEC2B9 /* BotHistoryCache.swift in Sources */,
 				013E4253ACC0484FA59DC45F /* BotConversation.swift in Sources */,
 				9BB85D722406416798DFA518 /* BotPromptMode.swift in Sources */,
 				B5A4FFE7618543F4821205E6 /* BotChatControlViews.swift in Sources */,
@@ -2199,6 +2214,7 @@
 				C8D6BA506D0F43B3AB34A9B4 /* BotArtifactTests.swift in Sources */,
 				142E7F57D82742678CF78DCA /* BotDraftTests.swift in Sources */,
 				236D35656DC54FFC9A91767D /* BotInboxTests.swift in Sources */,
+				C72A6DDA681F4CDABE7445DD /* BotHistoryCacheTests.swift in Sources */,
 				A496B07E0000000000000001 /* BotModeGateTests.swift in Sources */,
 				A496B07E0000000000000003 /* BotConnectionVersionTests.swift in Sources */,
 				A4730000000000000000A003 /* BotAvatarTests.swift in Sources */,

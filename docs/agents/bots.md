@@ -29,11 +29,13 @@ separate, and rejects a changed root before resume. Lookup can recover archived
 history; resume can auto-continue unfinished backend work. Neither is guaranteed
 to be read-only.
 
-History is memory-only. Open/recovery replaces it from a full resume snapshot.
+Live history is rebuilt from a full resume snapshot on open/recovery. A separate
+read-only local cache supports message search; see Local search below.
 Replay detects discontinuity but never appends text to an overlapping snapshot.
 Live events coalesce inflight snapshot reads using `omit_messages`; that installed
 handler path avoids history database reads. Completion and session-state events
-request full history. There is no transcript cache or speculative REST adapter.
+request full history. Live recovery never reads the local search cache and has
+no speculative REST adapter.
 Transient socket loss reconnects silently while the chat is active, with delays
 of 1, 2, 4, 8, 16 and then at most 30 seconds. Leaving the screen or backgrounding
 cancels recovery. Foreground/recovery reloads canonical identity, history and
@@ -417,3 +419,38 @@ mutation was used. Socket dispatch, read completion and confirmations all valida
 the captured context; disconnect invalidates them and never retries a write.
 Older snapshots cannot overwrite an acknowledged workspace change. Rejections
 keep the previous value and preserve the host's error text.
+
+## Local search
+
+The top-right search button opens a sheet with a focused search field and an
+All / Bots / Messages filter. Bot names use the current roster, including hidden
+bots when a query matches. Message search is entirely local: it searches saved
+user/assistant text from full, identity-validated Bot snapshots this iPhone has
+loaded. It never uses webui history or calls a server search/resume endpoint.
+The coverage label is “Messages saved on this iPhone.” There is no initial server
+crawl, attachment indexing, or live-token indexing.
+
+`BotHistoryCache` serializes disk access and matching off the main actor. It keeps
+one snapshot per configured server hash + connection UUID + Profile, including
+canonical root and compression tip, but no runtime identifier. Refresh replaces
+the snapshot, so undo/compression cannot accumulate obsolete search rows. The
+cache is disposable, under Library/Caches with file protection: 30-day lifetime,
+100 snapshots, 8 MB encoded globally, and up to the latest 500 projected messages
+per bot. Messages over 16 KB are omitted. Search returns at most 100 matches and
+asks the user to refine at the cap. Unknown roles, tool output, credentials from
+prompt cards, inflight text, and drafts are not indexed.
+
+A message result holds the selected immutable snapshot and opens a read-only
+text reader at its local message ID. Those IDs belong to the saved projection;
+they never become RPC targets. A bot result deliberately opens its normal chat
+only after the sheet dismisses and the connection/Profile selection is validated
+again. Cache results and reader selections are discarded on connection change;
+backgrounding cancels search. New queries cannot publish old search results.
+When the roster is unavailable, cached message results use the saved bot name;
+a successful roster refresh excludes messages from removed bots.
+
+Clear Offline Cache clears this server's Bot cache too. Removing a Bot connection,
+replacing its endpoint/account, signing out, or removing its configured server
+also removes its saved messages. Removal revokes pending writes for the old
+connection; clearing rejects writes captured before the clear and permits future
+snapshots. Identical Profile names on different connections never share history.

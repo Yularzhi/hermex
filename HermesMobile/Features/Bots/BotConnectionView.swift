@@ -69,6 +69,7 @@ import SwiftUI
                     do {
                         try store.remove(server: server)
                         if let saved {
+                            try? await BotHistoryCache.shared.remove(server: server, connectionID: saved.id)
                             await ChatDraftStore.shared.discardBotDrafts(server: server, connectionID: saved.id)
                             BotAvatarStore.shared.removeAll(connectionID: saved.id)
                             BotUnreadStore().remove(connectionID: saved.id)
@@ -103,6 +104,7 @@ import SwiftUI
             guard result["profiles"].list != nil else { throw BotFailure.unsupported }
             try store.save(candidate, server: server)
             if let saved, saved.id != candidate.id {
+                try? await BotHistoryCache.shared.remove(server: server, connectionID: saved.id)
                 await ChatDraftStore.shared.discardBotDrafts(server: server, connectionID: saved.id)
                 BotAvatarStore.shared.removeAll(connectionID: saved.id)
             }

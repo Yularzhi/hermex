@@ -5,7 +5,8 @@ import SwiftUI
     let server: URL
     let showSessions: () -> Void
     @State private var inbox: BotInbox
-    @State private var search = ""
+    @State private var showingSearch = false
+    @State private var searchedProfile: (connectionID: UUID, profileID: String)?
     @State private var showingSetup = false
     @State private var revision = UUID()
     /// The bot whose chat is open. One destination serves the hero tiles and the
@@ -20,7 +21,7 @@ import SwiftUI
     }
 
     var body: some View {
-        let rows = inbox.rows(matching: search)
+        let rows = inbox.rows(matching: "")
         List {
             Picker("Screen", selection: Binding(get: { true }, set: { if !$0 { showSessions() } })) {
                 Text("Sessions").tag(false)
@@ -63,7 +64,7 @@ import SwiftUI
                 ForEach(rows.hidden) { profile in
                     row(profile, dimmed: true)
                 }
-                if inbox.hiddenCount > 0 && search.isEmpty {
+                if inbox.hiddenCount > 0 {
                     Button(inbox.showsHidden ? "Hide hidden bots" : "Show hidden bots (\(inbox.hiddenCount))") {
                         inbox.showsHidden.toggle()
                     }
@@ -78,11 +79,25 @@ import SwiftUI
         }
         .listStyle(.plain)
         .navigationTitle("Bots")
-        .searchable(text: $search, prompt: "Search bots")
         .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                Button("Search bots and messages", systemImage: "magnifyingglass") { showingSearch = true }
+                    .disabled(inbox.connection == nil)
+            }
+            if #available(iOS 26, *) { ToolbarSpacer(.fixed, placement: .topBarTrailing) }
             ToolbarItem(placement: .topBarTrailing) {
                 Button("Bot connection", systemImage: "gearshape") { showingSetup = true }
             }
+        }
+        .sheet(isPresented: $showingSearch, onDismiss: openSearchSelection) {
+            BotSearchView(inbox: inbox) { profile in
+                guard let connection = inbox.connection else { return }
+                searchedProfile = (connection.id, profile.id)
+            }
+        }
+        .onChange(of: inbox.connection?.id) {
+            showingSearch = false
+            searchedProfile = nil
         }
         .sheet(isPresented: $showingSetup, onDismiss: { revision = UUID() }) {
             NavigationStack { BotConnectionView(server: server) }
@@ -99,6 +114,14 @@ import SwiftUI
             else { inbox.close() }
         }
         .onDisappear { inbox.close() }
+    }
+
+    /// Resolve the selection again after the sheet closes so a refreshed roster
+    /// or changed connection cannot open an old bot under a new identity.
+    private func openSearchSelection() {
+        defer { searchedProfile = nil }
+        guard let selection = searchedProfile, inbox.connection?.id == selection.connectionID else { return }
+        openProfile = inbox.profiles.first { $0.id == selection.profileID }
     }
 
     private func row(_ profile: BotProfile, dimmed: Bool) -> some View {
@@ -204,7 +227,7 @@ private struct BotInboxRow: View {
 
 /// The Desktop avatar fitted into a square, or a letter tile on a tinted circle.
 /// Desktop assets are shapes on a transparent background, so they are not clipped.
-private struct BotAvatarView: View {
+struct BotAvatarView: View {
     let profile: BotProfile
     let avatar: UIImage?
     let size: CGFloat

@@ -7,6 +7,51 @@ import XCTest
 @testable import HermesMobile
 
 @MainActor final class BotChatPresentationTests: XCTestCase {
+    func testLocalBotSearchShowsBotNamesAndNeverResumesWhileBrowsing() async throws {
+        let server = URL(string: "https://search.example")!
+        let connection = BotConnection(id: UUID(), name: "Fixture", address: server, username: "fixture", password: "fixture")
+        let store = BotConnectionStore(keychain: InMemoryKeychainStore())
+        try store.save(connection, server: server)
+        let wire = BotInboxFixtureWire(roster: [
+            .object(["name": .string("inbox"), "display_name": .string("Inbox"), "description": .string("Your email triage bot")]),
+            .object(["name": .string("apartments"), "display_name": .string("Apartments"), "description": .string("Your apartment hunt specialist")])
+        ])
+        let inbox = BotInbox(server: server, store: store, makeWire: { _ in wire })
+        await inbox.open()
+        let cache = BotHistoryCache()
+        let window = try show(BotSearchView(inbox: inbox, cache: cache) { _ in XCTFail("Browsing cannot select a bot") }
+            .environment(\.scenePhase, .active))
+        window.overrideUserInterfaceStyle = .dark
+        defer { close(window); inbox.close() }
+        await renderFrames(8)
+        let text = try screenshot(window, name: "481-bot-search")
+        XCTAssertTrue(text.contains("Apartments"), text)
+        XCTAssertTrue(text.contains("Inbox"), text)
+        XCTAssertNotNil(descendants(window).compactMap { $0 as? UITextField }.first { $0.isFirstResponder })
+        XCTAssertEqual(wire.calls.map { $0.0 }, ["profiles.list"])
+    }
+
+    func testCachedMessageReaderShowsTheSelectedSavedMessage() async throws {
+        let server = URL(string: "https://search.example")!
+        let scope = BotHistoryCache.Scope(server: server, connectionID: UUID())
+        let cache = BotHistoryCache()
+        let messages = (0..<40).map { index in
+            ChatMessage(role: index.isMultiple(of: 2) ? "user" : "assistant",
+                        content: index == 20 ? "Newport viewing confirmed" : "Saved conversation row \(index)",
+                        timestamp: nil, messageId: "root/\(index)")
+        }
+        try await cache.replace(scope: scope, profileID: "inbox", root: "root", tip: "tip", messages: messages)
+        let hits = try await cache.search("Newport", scope: scope, profileIDs: ["inbox"])
+        let hit = try XCTUnwrap(hits.first)
+        let profile = BotProfile(.object(["name": .string("inbox"), "display_name": .string("Inbox")]))!
+        let window = try show(BotCachedHistoryView(hit: hit, profile: profile))
+        window.overrideUserInterfaceStyle = .dark
+        defer { close(window) }
+        await renderFrames(8)
+        let text = try screenshot(window, name: "481-cached-message-reader")
+        XCTAssertTrue(text.contains("Newport viewing confirmed"), text)
+    }
+
     private func make(_ wire: BotFixtureWire) -> BotConversation {
         BotConversation(
             server: URL(string: "https://webui.example")!,

@@ -312,6 +312,32 @@ import Vision
         model.suspend()
     }
 
+    func testOnlyAcceptedSnapshotsPopulateTheLocalMessageCache() async throws {
+        let cache = BotHistoryCache()
+        let wire = BotFixtureWire()
+        wire.history = [.object(["role": .string("user"), "text": .string("Newport")])]
+        let server = URL(string: "https://cache.example")!
+        let connection = BotConnection(id: UUID(), name: "Fixture", address: server, username: "fixture", password: "fixture")
+        let profile = BotProfile(.object(["name": .string("inbox-triage")]))!
+        let model = BotConversation(server: server, connection: connection, profile: profile, historyCache: cache,
+                                    wire: wire, drafts: ChatDraftStore(persistence: BotMemoryDrafts()))
+        await model.recover()
+        await model.historyCacheTask?.value
+        let scope = BotHistoryCache.Scope(server: server, connectionID: connection.id)
+        let hits = try await cache.search("Newport", scope: scope, profileIDs: [profile.id])
+        XCTAssertEqual(hits.count, 1)
+        XCTAssertEqual(hits.first?.snapshot.root, "root")
+        XCTAssertEqual(hits.first?.snapshot.tip, "tip")
+        XCTAssertEqual(model.runtime, "runtime")
+        wire.root = "wrong-root"
+        wire.history = [.object(["role": .string("assistant"), "text": .string("replacement")])]
+        await model.recover()
+        await model.historyCacheTask?.value
+        let rejected = try await cache.search("replacement", scope: scope, profileIDs: [profile.id])
+        XCTAssertTrue(rejected.isEmpty)
+        model.suspend()
+    }
+
     func testOpenKeepsCanonicalRootTipAndRuntimeSeparate() async {
         let wire = BotFixtureWire()
         let model = make(wire)

@@ -18,7 +18,7 @@ import SwiftUI
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
 
     init(server: URL, connection: BotConnection, profile: BotProfile) {
-        _model = State(initialValue: BotConversation(server: server, connection: connection, profile: profile))
+        _model = State(initialValue: BotConversation(server: server, connection: connection, profile: profile, historyCache: .shared))
     }
 
     init(model: BotConversation) {

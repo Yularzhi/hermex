@@ -74,15 +74,18 @@ import Observation
     private var localOperation = false
     private var hydrated = false
     private let wire: any BotTransport
+    private let historyCache: BotHistoryCache?
+    private(set) var historyCacheTask: Task<Void, Never>?
     private let drafts: ChatDraftStore
 
     init(server: URL, connection: BotConnection, profile: BotProfile,
-         wire: (any BotTransport)? = nil, drafts: ChatDraftStore? = nil,
+         historyCache: BotHistoryCache? = nil, wire: (any BotTransport)? = nil, drafts: ChatDraftStore? = nil,
          attachmentCopies: any ChatDraftAttachmentStoring = ChatDraftAttachmentStore.shared,
          reconnectDelay: @escaping (Duration) async throws -> Void = { try await Task.sleep(for: $0) }) {
         self.server = server; self.connection = connection; self.profile = profile
         self.reconnectDelay = reconnectDelay
         self.wire = wire ?? BotClient(connection: connection)
+        self.historyCache = historyCache
         self.drafts = drafts ?? .shared
         self.attachments = BotAttachmentDraft(key: .bot(server: server, connectionID: connection.id, profile: profile.id),
                                               drafts: drafts ?? .shared, copies: attachmentCopies)
@@ -316,6 +319,18 @@ import Observation
             let projected = BotTranscriptProjection.project(history: history, root: root ?? "")
             messages = projected.messages
             settledActivity = projected.activity
+            if let historyCache, let root, let tip {
+                historyCacheTask?.cancel()
+                let scope = BotHistoryCache.Scope(server: server, connectionID: connection.id)
+                let profileID = profile.id
+                let profileName = profile.name
+                let saved = messages
+                let receivedAt = Date()
+                historyCacheTask = Task {
+                    try? await historyCache.replace(scope: scope, profileID: profileID, profileName: profileName, root: root, tip: tip,
+                                                    messages: saved, receivedAt: receivedAt)
+                }
+            }
         }
         if let next = BotPlan(snapshot["todo_state"]), next.revision >= (plan?.revision ?? 0) { plan = next }
         let inflight = snapshot["inflight"]
@@ -857,6 +872,7 @@ import Observation
     }
 
     func suspend() {
+        historyCacheTask?.cancel(); historyCacheTask = nil
         isActive = false; shouldRetryConnection = false; isReconnecting = false
         reconnectTask?.cancel(); reconnectTask = nil
         resetConnection()
