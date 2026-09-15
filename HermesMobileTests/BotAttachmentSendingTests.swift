@@ -231,6 +231,33 @@ extension BotAttachmentSendingTests {
         }
     }
 
+    func testQueuedUploadFailureDoesNotRejectQueueModeOrRefreshTheTurn() async throws {
+        for cancelled in [false, true] {
+            let wire = BotFixtureWire(); wire.running = true
+            let model = make(wire, drafts: store(), copies: BotAttachmentCopies())
+            await model.recover()
+            await model.attachments.stage(data: photo, filename: "image.jpg")
+            let reads = wire.calls.filter { $0.0 == "session.resume" }.count
+            wire.imageUpload = { _, _, _ in
+                if cancelled {
+                    model.cancelAttachmentUpload()
+                    try Task.checkCancellation()
+                }
+                throw BotFailure.rejected(-32601)
+            }
+            await model.submit(try XCTUnwrap(model.preparePrompt(.queue)))
+            XCTAssertEqual(model.errorMessage, cancelled
+                ? "Upload cancelled. Your message and attachments are still here."
+                : BotFailure.rejected(-32601).localizedDescription)
+            XCTAssertFalse(model.uncertainSend)
+            XCTAssertTrue(model.maySubmit(.queue))
+            XCTAssertEqual(model.attachments.items.count, 1)
+            XCTAssertEqual(wire.calls.filter { $0.0 == "session.resume" }.count, reads)
+            XCTAssertFalse(wire.calls.contains { $0.0 == "prompt.submit" })
+            model.suspend()
+        }
+    }
+
     func testCancelUploadStopsBeforePromptAndReleasesLocalDraft() async {
         let wire = BotFixtureWire(); let model = make(wire, drafts: store(), copies: BotAttachmentCopies())
         await model.recover(); await model.attachments.stage(data: photo, filename: "image.jpg")

@@ -35,7 +35,7 @@ struct BotArtifactMessageView: View {
                 preview = TranscriptMediaPreviewItem(reference: TranscriptMediaReference(rawReference: path))
                 return .handled
             }
-            return ["http", "https"].contains(url.scheme?.lowercased() ?? "") ? .systemAction : .discarded
+            return .systemAction
         })
         .sheet(item: $preview) { item in
             BotArtifactPreview(reference: item.reference) {

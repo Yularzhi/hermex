@@ -449,7 +449,11 @@ import Observation
             let needsRecovery: Bool
             if case BotFailure.rejected(let code) = error { needsRecovery = [401, 403, 4001, 4090].contains(code) }
             else { needsRecovery = false }
-            if action.mode != .send, safe, !needsRecovery {
+            if !promptDispatched, !action.attachmentIDs.isEmpty {
+                errorMessage = error is CancellationError || error as? BotFailure == .stale
+                    ? String(localized: "Upload cancelled. Your message and attachments are still here.")
+                    : error.localizedDescription
+            } else if action.mode != .send, safe, !needsRecovery {
                 if case BotFailure.rejected(let code) = error, [-32601, 4010].contains(code) {
                     // 4010 can be temporary during initialization; do not hide it
                     // permanently. A missing method stays unavailable this lifetime.
